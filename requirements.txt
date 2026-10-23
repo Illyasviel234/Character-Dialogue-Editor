@@ -1,0 +1,19 @@
+# Python 3.12（与 .venv 一致）
+# 安装：.venv/Scripts/python.exe -m pip install -r requirements.txt
+# torch 需要从 CPU 源安装：
+#   .venv/Scripts/python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+numpy==2.5.4
+scipy==1.18.1
+scikit-learn==1.9.1
+torch==2.14.1
+torchaudio==2.11.0
+speechbrain==1.1.2
+soundfile==0.14.0
+PySide6-Essentials==6.12.0
+
+# 注意：faster-whisper 1.2.1 与 av>=15 不兼容（av 移除了 metadata_errors 参数）。
+# 本项目通过 scipy 读 WAV 后直接传 numpy 数组给模型，绕开了 av 解码，
+# 因此不要升级 av；若被升级，转写会在 decode_audio 处报 TypeError。

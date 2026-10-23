@@ -1,0 +1,36 @@
+# 虚拟环境（约 1.2 GB，按 requirements.txt 重建）
+.venv/
+
+# 模型权重（约 3.1 GB，首次运行自动下载）
+models/
+
+# ffmpeg 二进制副本（约 304 MB）
+tools/
+
+# 源视频与成片（体积大且涉及版权，不入库）
+input/
+output/
+
+# 流水线产物：只保留代码和文档
+work/*
+!work/*.py
+!work/*.md
+!work/core/
+!work/core/*.py
+work/jobs/
+work/parts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 编辑器与系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# 工作区元数据
+.workbuddy-ai/
