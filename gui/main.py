@@ -18,7 +18,7 @@ WORK = os.path.join(ROOT, "work")
 sys.path.insert(0, WORK)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core import manifest, media, paths, scoring, segmenter  # noqa: E402
+from core import manifest, media, naming, paths, scoring, segmenter  # noqa: E402
 from runner import Runner, Step  # noqa: E402
 from theme import QSS  # noqa: E402
 
@@ -58,6 +58,7 @@ class MainWindow(QMainWindow):
         self.checked = set()
         self.seed_ids = []
         self.mode = None
+        self.run_id = ""
         self.last_output = ""
         self._filling = False
         self._scroll_pending = False
@@ -331,6 +332,7 @@ class MainWindow(QMainWindow):
 
     def _reset_state(self):
         self.segments = []
+        self.run_id = ""
         self.emb = None
         self.emb_ids = []
         self.scores = {}
@@ -347,27 +349,29 @@ class MainWindow(QMainWindow):
             return
         man = manifest.load_manifest(self.sid)
         ok, why = manifest.matches(man, self.source)
-
-        if not ok and manifest.migrate_legacy(self.video, self.sid, self.source):
-            man = manifest.load_manifest(self.sid)
-            ok, why = manifest.matches(man, self.source)
-            if ok:
-                self.append_log("已把旧版缓存迁入当前任务目录。")
-
         if not ok:
             self.append_log(f"该视频尚无可用分析结果（{why}），请点「开始分析」。")
             return
-        if not manifest.has_analysis(self.sid):
-            self.append_log("分析结果不完整，请重新运行分析。")
+
+        rid = manifest.active_run(self.sid)
+        if not rid:
+            pending = manifest.pending_run(self.sid)
+            if pending:
+                self.append_log(f"检测到未完成的分析运行 {pending}（转写有、声纹缺失或校验未过），"
+                                f"请重新执行分析。")
+            else:
+                self.append_log("该视频尚无可用分析结果，请点「开始分析」。")
             return
 
+        rdir = manifest.run_dir(self.sid, rid)
         try:
-            with open(manifest.artifact(self.sid, manifest.TRANSCRIPT), encoding="utf-8") as f:
+            with open(os.path.join(rdir, manifest.TRANSCRIPT), encoding="utf-8") as f:
                 tr = json.load(f)
             self.segments = self._clean(tr.get("segments") or [])
             self.emb, self.emb_ids = scoring.load_embeddings(
-                manifest.artifact(self.sid, manifest.EMBEDDINGS))
-            self.append_log(f"已载入分析结果：{len(self.segments)} 个语段。")
+                os.path.join(rdir, manifest.EMBEDDINGS))
+            self.run_id = rid
+            self.append_log(f"已载入分析结果：{len(self.segments)} 个语段（运行 {rid}）")
             self.rescore_by_keyword(quiet=True)
         except Exception as e:
             self.append_log(f"载入失败：{e}")
@@ -397,8 +401,15 @@ class MainWindow(QMainWindow):
         keywords = self.kw_edit.text().replace("，", ",").split(",")
         seeds = scoring.keyword_seeds(self.segments, keywords)
         if not seeds:
+            # 零命中时不能留一张空表，否则用户既看不到台词也无法手动选种子
+            self.seed_ids = []
+            self.scores = {}
+            self.checked = set()
+            self.fill_table()
+            self.refresh_summary()
             if not quiet:
-                self.append_log("特征词没有命中任何台词，请换几个词。")
+                self.append_log("特征词没有命中任何台词，已列出全部语段。"
+                                "可手动勾选几句后点「用勾选项作种子」。")
             return
         self.seed_ids = seeds
         self._apply_scores(quiet)
@@ -561,11 +572,13 @@ class MainWindow(QMainWindow):
         payload = {
             "version": manifest.VERSION,
             "source_id": self.sid,
+            "run_id": self.run_id,
             "source": self.source,
             "role": role,
             "created": datetime.now().isoformat(timespec="seconds"),
             "threshold": self.thr_spin.value(),
             "model": self.model_combo.currentText(),
+            "seed_ids": sorted(self.seed_ids),
             "merge_gap": self.gap_spin.value(),
             "pad_head": self.pad_h.value(),
             "pad_tail": self.pad_t.value(),
@@ -574,8 +587,9 @@ class MainWindow(QMainWindow):
         }
         manifest.atomic_write_json(manifest.artifact(self.sid, manifest.SELECTED), payload)
 
-        stem = os.path.splitext(os.path.basename(self.video))[0]
-        self.last_output = os.path.join(paths.OUTPUT, f"{stem}_{role}_clip.mp4")
+        stem = naming.safe_stem(self.video)
+        safe_role = naming.safe_filename(role, fallback="role")
+        self.last_output = os.path.join(paths.OUTPUT, f"{stem}_{safe_role}_clip.mp4")
 
         self.mode = "render"
         self._busy(True)

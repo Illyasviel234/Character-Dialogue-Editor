@@ -9,7 +9,7 @@ import json
 import os
 import sys
 
-from core import cli, manifest, paths
+from core import cli, manifest, naming, paths
 
 
 def ts(t):
@@ -41,8 +41,8 @@ def main():
 
     man = manifest.load_manifest(sid) or {}
     src = sel.get("source") or man.get("source") or {}
-    role = sel.get("role") or "目标角色"
-    stem = os.path.splitext(src.get("name") or os.path.basename(video))[0]
+    role = naming.safe_filename(sel.get("role") or "目标角色", fallback="role")
+    stem = naming.safe_stem(src.get("name") or os.path.basename(video))
     base = f"{stem}_{role}"
     duration = float(src.get("duration") or 0)
     total = float(sel.get("total_sec") or sum(s["dur"] for s in segs))

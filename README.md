@@ -67,20 +67,32 @@ cd work
 
 全部脚本支持 `--video` 指定源文件，省略时取 `input/` 下第一个视频。完整参数见 [`work/脚本使用说明.md`](work/脚本使用说明.md)。
 
-## 任务隔离
+## 任务隔离与数据完整性
 
-每个源视频对应 `work/jobs/<源文件ID>/` 一个独立目录，ID 由文件名、大小和修改时间生成：
+每个源视频对应 `work/jobs/<源文件ID>/`，ID 由文件名加**内容指纹**（大小 + 首尾各 1 MiB 的 SHA-256）生成。同名同大小同修改时间但内容不同的文件不会互相污染。
+
+每次分析是一个独立的 run：
 
 ```
-work/jobs/re0_1_08-5d77c1c0/
-├── manifest.json     源文件路径、大小、修改时间、时长、宽高、帧率、模型、语言
+work/jobs/re0_1_08-7828987381905c07/
+├── manifest.json              源身份 + 运行记录
 ├── audio16k.wav
-├── transcript.json
-├── embeddings.npz
-└── selected.json     切点方案，含角色名、阈值、每段相似度
+├── selected.json              切点方案，含角色名、阈值、每段相似度
+└── runs/
+    └── 20261023-111240-72ee95/
+        ├── transcript.json
+        └── embeddings.npz
 ```
 
-加载缓存前会校验 manifest：文件大小或时长对不上就不使用，切换视频时立即清空旧状态并禁用导出。所有产物先写临时文件再原子替换，失败的任务不会留下半新半旧的数据。
+分析分三阶段提交：`running` → `transcribed` → `complete`。声纹阶段结束后校验两份产物是否自洽（声纹 ID 必须都能在转写里找到、维度 192、来源一致），通过才标记 `complete` 并设为 `active_run`。
+
+只有 `complete` 的活动运行会被加载。因此"转写成功但声纹失败"不会留下半套数据被误用——下次打开会明确提示该运行未完成。
+
+旧版扁平缓存（`work/transcript.json`）不再自动迁移，因为旧文件没有来源指纹，无法判断归属。需要手动确认：
+
+```bash
+cd work && ../.venv/Scripts/python.exe import_legacy.py --yes
+```
 
 ## 环境
 
@@ -108,9 +120,10 @@ work/jobs/re0_1_08-5d77c1c0/
 │   ├── core/             核心层，GUI 与 CLI 共用
 │   │   ├── paths.py      统一路径
 │   │   ├── media.py      ffprobe 探测
-│   │   ├── manifest.py   任务清单与缓存校验
+│   │   ├── manifest.py   任务清单与 run 状态机
 │   │   ├── segmenter.py  片段合并
 │   │   ├── scoring.py    声纹打分
+│   │   ├── naming.py     输出文件名净化
 │   │   └── cli.py        命令行公共部分
 │   ├── extract_audio.py  抽 16k 单声道
 │   ├── transcribe.py     日语转写
@@ -119,9 +132,10 @@ work/jobs/re0_1_08-5d77c1c0/
 │   ├── cut.py            切割拼接
 │   ├── gen_report.py     生成核对清单
 │   ├── eval_threshold.py 阈值与模板评估
+│   ├── import_legacy.py  手动导入旧版缓存
 │   ├── verify.py         环境自检
 │   └── 脚本使用说明.md
-├── tests/                单元测试（23 项）
+├── tests/                单元与集成测试（44 项）
 ├── input/                源视频
 ├── output/               成片与清单
 ├── models/               模型权重（3.1 GB）
@@ -132,13 +146,16 @@ work/jobs/re0_1_08-5d77c1c0/
 ## 测试
 
 ```bash
-.venv/Scripts/python.exe -m unittest discover -s tests -t . -v   # 23 项单元测试
+.venv/Scripts/python.exe -m unittest discover -s tests -t . -v   # 44 项测试
 cd work && ../.venv/Scripts/python.exe verify.py                 # 环境自检
 ```
 
-单元测试覆盖：片段合并的相邻/间隔/插话/缺失 ID/重复 ID/越界/负时长，声纹模板的空种子/单种子/离群剔除/负样本，以及 manifest 的匹配与失效判断。
+测试分两类：
 
-`verify.py` 逐项检查目录、ffmpeg、模型文件、源视频探测、whisper 与 ECAPA 加载、切点合法性，任何一项失败都会返回非零退出码。
+- **单元测试**（39 项）：片段合并的相邻/间隔/插话/缺失 ID/重复 ID/越界/负时长，声纹模板的空种子/单种子/离群剔除/负样本，manifest 的内容指纹与碰撞、run 状态机、混合产物拒绝，以及文件名净化。
+- **集成测试**（5 项）：用 ffmpeg 合成 6 秒素材，真实跑一遍编码，验证 1 段/2 段/10 段场景的时长偏差都在一帧以内、音视频结束时间相差不超过两帧、裸输出文件名能正确落到绝对路径。
+
+`verify.py` 逐项检查目录、ffmpeg、模型文件、源视频探测、whisper 与 ECAPA 加载、运行状态与切点合法性，任何一项失败都会返回非零退出码。
 
 ## 性能实测
 
@@ -150,7 +167,7 @@ cd work && ../.venv/Scripts/python.exe verify.py                 # 环境自检
 | 日语转写（403 段） | 2 分 30 秒 |
 | 声纹提取（399 段） | 15 秒 |
 | 相似度重算（GUI 内） | 毫秒级 |
-| 切割拼接（14 段，4K 输出） | 67 秒 |
+| 切割拼接（14 段，4K 输出，单次编码） | 57 秒 |
 
 ## 可调参数
 
@@ -167,6 +184,10 @@ cd work && ../.venv/Scripts/python.exe verify.py                 # 环境自检
 ## 导出规格
 
 默认「保持源规格」：不缩放、不强制帧率，输出宽高、帧率、像素比与源一致（实测 3840×2160 / 23.976 fps / SAR 1:1 完全保持）。只有显式选择 1080p 或 720p 才缩放，且用 `force_original_aspect_ratio=decrease` 加补边，不会拉伸。
+
+切割采用**单次 filter graph 编码**：所有片段作为独立输入 seek 到各自位置，经 `setpts/asetpts` 归零后在 concat filter 里拼接，只做一次 H.264/AAC 编码。这样不会出现"每段分别编码再流复制拼接"时的 AAC 延迟与时间戳舍入累积。
+
+切点会先吸附到帧网格再编码，保证每段是整数帧。实测 14 段 101.99 秒的计划，成片视频流偏差 41 ms（约 1 帧）。
 
 ## 已知限制
 

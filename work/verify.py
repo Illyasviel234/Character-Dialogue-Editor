@@ -108,16 +108,22 @@ def main():
         if not video:
             raise RuntimeError("没有视频")
         sid, jdir = cli.job_of(video)
+        rid = manifest.active_run(sid)
+        if not rid:
+            pending = manifest.pending_run(sid)
+            if pending:
+                raise RuntimeError(f"运行 {pending} 未完成（缺声纹或校验未过）")
+            return "尚未生成分析结果（可忽略）"
         sel = os.path.join(jdir, manifest.SELECTED)
         if not os.path.exists(sel):
-            return "尚未生成切点方案（可忽略）"
+            return f"运行 {rid} 已完成，尚未生成切点方案"
         with open(sel, encoding="utf-8") as f:
             d = json.load(f)
         segs = d.get("segments") or []
         bad = [s for s in segs if s["end"] <= s["start"] or s["start"] < 0]
         if bad:
             raise RuntimeError(f"{len(bad)} 个片段时间非法")
-        return f"{len(segs)} 段，{d.get('total_sec')} 秒"
+        return f"运行 {rid} · {len(segs)} 段，{d.get('total_sec')} 秒"
 
     check("目录结构", c_paths)
     check("ffmpeg", c_ffmpeg)

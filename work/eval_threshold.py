@@ -52,8 +52,11 @@ def main():
     video = cli.resolve_video(args.video)
     sid, jdir = cli.job_of(video)
 
-    tpath = os.path.join(jdir, manifest.TRANSCRIPT)
-    epath = os.path.join(jdir, manifest.EMBEDDINGS)
+    rdir = manifest.active_run_dir(sid)
+    if not rdir:
+        sys.exit("没有可用的分析结果，请先运行 transcribe.py 与 voiceprint.py")
+    tpath = os.path.join(rdir, manifest.TRANSCRIPT)
+    epath = os.path.join(rdir, manifest.EMBEDDINGS)
     if not (os.path.exists(tpath) and os.path.exists(epath)):
         sys.exit("需要先完成转写与声纹提取")
 

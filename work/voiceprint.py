@@ -1,9 +1,11 @@
 """逐句提取声纹向量。
 
-主流程只负责产出 embeddings.npz；聚类容易失败且对结果无影响，
-因此移到 --cluster 的可选诊断里。
+承接 transcribe.py 建立的 run，产物写入同一 run 目录。
+完成后由 manifest.finalize_run 校验两份产物是否自洽，
+通过才把这次运行标记为 complete 并设为活动结果。
 """
 
+import json
 import os
 import sys
 
@@ -67,7 +69,6 @@ def cluster_diagnose(E, ids, segments):
     if len(E) < 8:
         print("[skip] 样本不足 8 条，跳过聚类诊断")
         return
-    by_id = {s["id"]: s for s in segments}
     for thr in (0.40, 0.50, 0.60):
         try:
             lab = AgglomerativeClustering(n_clusters=None, metric="cosine",
@@ -88,24 +89,31 @@ def cluster_diagnose(E, ids, segments):
 def main():
     p = cli.new_parser("逐句提取声纹向量（ECAPA-TDNN）")
     cli.add_video(p)
+    p.add_argument("--run", default=None, help="指定运行 ID，默认接续待完成的运行")
     p.add_argument("--cluster", action="store_true", help="额外运行聚类诊断")
     args = p.parse_args()
 
     video = cli.resolve_video(args.video)
     sid, source, jdir, info = cli.prepare(video)
 
-    tpath = os.path.join(jdir, manifest.TRANSCRIPT)
+    run_id = args.run or manifest.pending_run(sid)
+    if not run_id:
+        if manifest.active_run(sid):
+            sys.exit("已有完整的分析结果。如需重新分析，请先运行 transcribe.py")
+        sys.exit("没有待完成的分析运行，请先运行 transcribe.py")
+
+    tpath = manifest.run_artifact(sid, run_id, manifest.TRANSCRIPT)
     apath = os.path.join(jdir, "audio16k.wav")
     if not os.path.exists(tpath):
-        sys.exit("缺少转写结果，请先运行 transcribe.py")
+        sys.exit(f"运行 {run_id} 缺少转写结果")
     if not os.path.exists(apath):
         sys.exit("缺少 16k 音频，请先运行 extract_audio.py")
 
-    import json
     with open(tpath, encoding="utf-8") as f:
         tr = json.load(f)
     segments = tr.get("segments") or []
     if not segments:
+        manifest.fail_run(sid, run_id, "转写为空")
         sys.exit("转写结果为空，无法提取声纹")
 
     sr, data = wavfile.read(apath)
@@ -113,18 +121,27 @@ def main():
         data = data.mean(axis=1)
     data = data.astype(np.float32) / 32768.0
 
-    encoder = load_encoder()
-    E, ids, skipped = extract(encoder, data, sr, segments)
-    if not ids:
-        sys.exit(f"所有语段都短于 {MIN_DUR}s，没有可用声纹")
+    try:
+        encoder = load_encoder()
+        E, ids, skipped = extract(encoder, data, sr, segments)
+        if not ids:
+            raise RuntimeError(f"所有语段都短于 {MIN_DUR}s，没有可用声纹")
 
-    out = os.path.join(jdir, manifest.EMBEDDINGS)
-    tmp = out + ".tmp.npz"
-    np.savez(tmp, emb=E, ids=np.array(ids))
-    os.replace(tmp, out)
+        out = manifest.run_artifact(sid, run_id, manifest.EMBEDDINGS)
+        tmp = out + ".tmp.npz"
+        np.savez(tmp, emb=E, ids=np.array(ids))
+        os.replace(tmp, out)
+    except Exception as e:
+        manifest.fail_run(sid, run_id, e)
+        sys.exit(f"声纹提取失败：{e}")
+
+    ok, detail = manifest.finalize_run(sid, run_id)
+    if not ok:
+        sys.exit(f"分析结果未通过校验：{detail}")
 
     print(f"[ok] {E.shape[0]} 条声纹（跳过 {skipped} 条过短语段）")
-    print(f"[out] {out}")
+    print(f"[ok] 本次运行已提交：{run_id}")
+    print(f"[ok] 校验：{detail}")
 
     if args.cluster:
         print("[cluster] 聚类诊断：")

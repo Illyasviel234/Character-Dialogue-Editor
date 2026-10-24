@@ -1,6 +1,9 @@
-"""日语语音转写，结果写入任务目录并登记 manifest。"""
+"""日语语音转写。
 
-import json
+每次分析都会新建一个 run，产物写入 runs/<run_id>/。
+转写成功后只把状态标为 transcribed，必须等声纹阶段校验通过才算 complete。
+"""
+
 import os
 import sys
 import time
@@ -31,7 +34,7 @@ def load_model(name, device):
     return m, "cpu"
 
 
-def transcribe_audio(model, audio, duration):
+def transcribe_audio(model, audio):
     segments, info = model.transcribe(
         audio,
         language="ja",
@@ -83,31 +86,41 @@ def main():
     duration = len(audio) / float(sr or 16000)
     print(f"[ok] 音频 {duration:.1f}s", flush=True)
 
-    t0 = time.time()
-    model, used = load_model(args.model, args.device)
-    print(f"[ok] 模型 {args.model} 运行于 {used}", flush=True)
+    run_id = manifest.new_run(sid, source, model=args.model, device=args.device)
+    print(f"[run] {run_id}", flush=True)
 
-    rows, winfo = transcribe_audio(model, audio, duration)
-    if not rows:
-        sys.exit("没有识别到任何语段，请检查音频或换用更大的模型")
+    try:
+        t0 = time.time()
+        model, used = load_model(args.model, args.device)
+        print(f"[ok] 模型 {args.model} 运行于 {used}", flush=True)
 
-    payload = {
-        "version": manifest.VERSION,
-        "source_id": sid,
-        "source_name": source["name"],
-        "model": args.model,
-        "device": used,
-        "duration": round(duration, 3),
-        "language": winfo.language,
-        "language_probability": round(winfo.language_probability, 4),
-        "elapsed_sec": round(time.time() - t0, 1),
-        "segments": rows,
-    }
-    manifest.atomic_write_json(os.path.join(jdir, manifest.TRANSCRIPT), payload)
-    manifest.save_manifest(sid, source, model=args.model, device=used)
+        rows, winfo = transcribe_audio(model, audio)
+        if not rows:
+            raise RuntimeError("没有识别到任何语段，请检查音频或换用更大的模型")
+
+        payload = {
+            "version": manifest.VERSION,
+            "run_id": run_id,
+            "source_id": sid,
+            "source_name": source["name"],
+            "model": args.model,
+            "device": used,
+            "duration": round(duration, 3),
+            "language": winfo.language,
+            "language_probability": round(winfo.language_probability, 4),
+            "elapsed_sec": round(time.time() - t0, 1),
+            "segments": rows,
+        }
+        manifest.atomic_write_json(
+            manifest.run_artifact(sid, run_id, manifest.TRANSCRIPT), payload)
+        manifest.update_run(sid, run_id, status="transcribed", device=used,
+                            segments=len(rows))
+    except Exception as e:
+        manifest.fail_run(sid, run_id, e)
+        sys.exit(f"转写失败：{e}")
 
     print(f"[done] {len(rows)} 段，耗时 {time.time() - t0:.1f}s", flush=True)
-    print(f"[out] {os.path.join(jdir, manifest.TRANSCRIPT)}", flush=True)
+    print(f"[next] 继续运行 voiceprint.py 完成本次分析", flush=True)
 
 
 if __name__ == "__main__":

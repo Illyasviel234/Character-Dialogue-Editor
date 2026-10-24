@@ -47,7 +47,10 @@ def probe(path):
     if video:
         info["width"] = int(video.get("width") or 0)
         info["height"] = int(video.get("height") or 0)
-        info["fps"] = round(_ratio(video.get("r_frame_rate")), 3)
+        info["fps"] = round(_ratio(video.get("r_frame_rate")), 6)
+        info["fps_frac"] = video.get("r_frame_rate") or ""
+        info["video_duration"] = round(_ratio(video.get("duration")), 3)
+        info["nb_frames"] = int(video.get("nb_frames") or 0)
         info["sar"] = video.get("sample_aspect_ratio") or "1:1"
         rot = video.get("tags", {}).get("rotate")
         if rot is None:

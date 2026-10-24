@@ -3,6 +3,6 @@
 命令行脚本与图形界面都从这里取实现，避免两套逻辑分叉。
 """
 
-from . import cli, manifest, media, paths, scoring, segmenter  # noqa: F401
+from . import cli, manifest, media, naming, paths, scoring, segmenter  # noqa: F401
 
-__all__ = ["cli", "manifest", "media", "paths", "scoring", "segmenter"]
+__all__ = ["cli", "manifest", "media", "naming", "paths", "scoring", "segmenter"]
