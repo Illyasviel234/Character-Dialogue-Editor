@@ -19,6 +19,7 @@ work/*
 !work/core/*.py
 work/jobs/
 work/parts/
+work/.cache/
 
 # Python
 __pycache__/
@@ -34,3 +35,5 @@ desktop.ini
 
 # 工作区元数据
 .workbuddy-ai/
+
+doc/

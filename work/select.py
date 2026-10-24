@@ -103,6 +103,9 @@ def main():
         s["score"] = round(sum(vals) / len(vals), 4) if vals else None
 
     total = round(sum(s["dur"] for s in segs), 2)
+    rid = manifest.active_run(sid)
+    run_rec = ((manifest.load_manifest(sid) or {}).get("runs") or {}).get(rid) or {}
+    track = int(run_rec.get("audio_track", manifest.audio_track(sid)))
     payload = {
         "version": manifest.VERSION,
         "source_id": sid,
@@ -112,6 +115,7 @@ def main():
         "created": datetime.now().isoformat(timespec="seconds"),
         "threshold": args.threshold,
         "model": tr.get("model", ""),
+        "audio_track": track,
         "seed_ids": seed_ids,
         "merge_gap": args.merge_gap,
         "pad_head": args.pad_head,

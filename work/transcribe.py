@@ -86,7 +86,8 @@ def main():
     duration = len(audio) / float(sr or 16000)
     print(f"[ok] 音频 {duration:.1f}s", flush=True)
 
-    run_id = manifest.new_run(sid, source, model=args.model, device=args.device)
+    run_id = manifest.new_run(sid, source, model=args.model, device=args.device,
+                              audio_track=manifest.audio_track(sid))
     print(f"[run] {run_id}", flush=True)
 
     try:

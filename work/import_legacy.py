@@ -50,7 +50,8 @@ def main():
                  "请核对上面的时长后加 --yes 重新执行。")
 
     run_id = manifest.new_run(sid, source, model=tr.get("model", ""),
-                              device=tr.get("device", ""))
+                              device=tr.get("device", ""),
+                              audio_track=manifest.audio_track(sid))
     shutil.copy2(LEGACY_TRANSCRIPT, manifest.run_artifact(sid, run_id, manifest.TRANSCRIPT))
     shutil.copy2(LEGACY_EMBEDDINGS, manifest.run_artifact(sid, run_id, manifest.EMBEDDINGS))
 

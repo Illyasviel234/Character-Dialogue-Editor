@@ -119,11 +119,11 @@ def main():
             return f"运行 {rid} 已完成，尚未生成切点方案"
         with open(sel, encoding="utf-8") as f:
             d = json.load(f)
-        segs = d.get("segments") or []
-        bad = [s for s in segs if s["end"] <= s["start"] or s["start"] < 0]
-        if bad:
-            raise RuntimeError(f"{len(bad)} 个片段时间非法")
-        return f"运行 {rid} · {len(segs)} 段，{d.get('total_sec')} 秒"
+        source = manifest.make_source(video, media.probe(video))
+        ok, why = manifest.validate_selection(sid, d, source)
+        if not ok:
+            raise RuntimeError(why)
+        return f"{why}，{d.get('total_sec')} 秒"
 
     check("目录结构", c_paths)
     check("ffmpeg", c_ffmpeg)

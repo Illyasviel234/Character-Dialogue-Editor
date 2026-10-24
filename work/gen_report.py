@@ -24,6 +24,8 @@ def human(sec):
 def main():
     p = cli.new_parser("生成片段核对清单")
     cli.add_video(p)
+    p.add_argument("--out-dir", default=None,
+                   help="清单输出目录，默认 output/")
     args = p.parse_args()
 
     video = cli.resolve_video(args.video)
@@ -35,9 +37,10 @@ def main():
     with open(sel_path, encoding="utf-8") as f:
         sel = json.load(f)
 
+    ok, why = manifest.validate_selection(sid, sel)
+    if not ok:
+        sys.exit(f"切点方案不可用：{why}")
     segs = sel.get("segments") or []
-    if not segs:
-        sys.exit("切点方案为空")
 
     man = manifest.load_manifest(sid) or {}
     src = sel.get("source") or man.get("source") or {}
@@ -48,9 +51,10 @@ def main():
     total = float(sel.get("total_sec") or sum(s["dur"] for s in segs))
     pct = (total / duration * 100) if duration else 0
 
-    os.makedirs(paths.OUTPUT, exist_ok=True)
-    csv_path = os.path.join(paths.OUTPUT, f"{base}_清单.csv")
-    html_path = os.path.join(paths.OUTPUT, f"{base}_清单.html")
+    out_dir = os.path.abspath(args.out_dir) if args.out_dir else paths.OUTPUT
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f"{base}_清单.csv")
+    html_path = os.path.join(out_dir, f"{base}_清单.html")
 
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)

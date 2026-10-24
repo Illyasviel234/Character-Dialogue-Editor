@@ -6,6 +6,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 WORK = os.path.join(ROOT, "work")
 CORE = os.path.join(WORK, "core")
 JOBS = os.path.join(WORK, "jobs")
+CACHE = os.path.join(WORK, ".cache")
 INPUT = os.path.join(ROOT, "input")
 OUTPUT = os.path.join(ROOT, "output")
 MODELS = os.path.join(ROOT, "models")
@@ -25,5 +26,5 @@ if not os.path.exists(FFPROBE):
 
 
 def ensure_dirs():
-    for d in (JOBS, OUTPUT, INPUT):
+    for d in (JOBS, OUTPUT, INPUT, CACHE):
         os.makedirs(d, exist_ok=True)
