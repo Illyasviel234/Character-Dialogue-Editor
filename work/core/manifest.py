@@ -187,6 +187,31 @@ def _read_json(path):
         return {}
 
 
+def _wav_header(path):
+    """只读 WAV 头，确认是 16 kHz / 单声道 / 16 位 / 非空。
+
+    wave.open 读参数不会把整段音频读进内存，788 MB 的片源也只是读头。
+    """
+    import wave
+    try:
+        with wave.open(path, "rb") as r:
+            rate = r.getframerate()
+            channels = r.getnchannels()
+            width = r.getsampwidth()
+            frames = r.getnframes()
+    except Exception as e:
+        return False, f"WAV 无法解析（{type(e).__name__}），文件可能损坏"
+    if rate != 16000:
+        return False, f"WAV 采样率 {rate} Hz，应为 16000"
+    if channels != 1:
+        return False, f"WAV 声道数 {channels}，应为 1"
+    if width != 2:
+        return False, f"WAV 位深 {width * 8}，应为 16"
+    if frames <= 0:
+        return False, "WAV 没有音频帧"
+    return True, ""
+
+
 def load_audio_info(sid, run_id=None):
     """这份 16k 音频来自第几条音轨。
 
@@ -382,10 +407,34 @@ def validate_run(sid, run_id):
             return False, "audio.json 缺少字段：" + "、".join(missing)
         if side["source_id"] != sid:
             return False, "音频属于其他源文件"
+
+        # 字段存在还不够：NaN 时长、负数流数、越界 track 都能骗过存在性检查
+        try:
+            track = int(side["track"])
+            streams = int(side["audio_streams"])
+            audio_dur = float(side["duration"])
+        except (TypeError, ValueError):
+            return False, "audio.json 数值字段非法"
+        if not math.isfinite(audio_dur) or audio_dur <= 0:
+            return False, "audio.json 的 duration 不是有效正数"
+        if streams <= 0:
+            return False, "audio.json 的 audio_streams 非法"
+        if not 0 <= track < streams:
+            return False, f"audio.json 的 track {track} 超出 0–{streams - 1}"
+
+        wav = run_wav if layout == "本次运行" else legacy_wav
+        ok_wav, why_wav = _wav_header(wav)
+        if not ok_wav:
+            return False, why_wav
+
+        tr_dur = float(tr.get("duration") or 0)
+        if tr_dur and abs(audio_dur - tr_dur) > 1.0:
+            return False, (f"audio.json 时长 {audio_dur:.1f}s 与转写 {tr_dur:.1f}s 不一致，"
+                           f"音频可能已被替换")
+
         used = int(rec.get("audio_track", 0))
-        have = int(side["track"])
-        if used != have:
-            return False, (f"音频来自第 {have + 1} 条音轨，本次运行用的是第 {used + 1} 条，"
+        if used != track:
+            return False, (f"音频来自第 {track + 1} 条音轨，本次运行用的是第 {used + 1} 条，"
                            f"请重新抽取音频后再分析")
 
         import numpy as np

@@ -7,6 +7,8 @@ import numpy as np
 
 from core import manifest, paths
 
+from tests.helpers import write_bad_wav, write_silence
+
 
 def write(path, data=b"x" * 100):
     with open(path, "wb") as f:
@@ -15,11 +17,12 @@ def write(path, data=b"x" * 100):
 
 
 def put_audio(case, sid, rid, track=0, seconds=10.0):
-    """在 run 目录里放一份占位音频与 audio.json。"""
+    """在 run 目录里放一份合法音频与 audio.json。
+
+    duration 与转写里的 duration 要对得上（容差 1 秒），所以这里让两者一致。
+    """
     wav = manifest.run_artifact(sid, rid, manifest.AUDIO_WAV)
-    os.makedirs(os.path.dirname(wav), exist_ok=True)
-    with open(wav, "wb") as f:
-        f.write(b"RIFF" + b"\0" * 64)
+    write_silence(wav, seconds=0.2)
     manifest.save_audio_info(sid, rid, sid, track, seconds, 1)
     return wav
 
@@ -166,7 +169,7 @@ class TestRunLifecycle(ManifestCase):
         sid = manifest.source_id(p)
         os.makedirs(manifest.job_dir(sid), exist_ok=True)
         rid = manifest.new_run(sid, src, model="large-v3", device="cpu")
-        put_audio(self, sid, rid)
+        put_audio(self, sid, rid, seconds=float(len(seg_ids) or 1))
 
         segs = [{"id": i, "start": i, "end": i + 1, "text": f"t{i}"} for i in seg_ids]
         manifest.atomic_write_json(
@@ -347,6 +350,48 @@ class TestRunLifecycle(ManifestCase):
         self.assertFalse(ok)
         self.assertIn("缺少字段", why)
 
+    def _bad_audio(self, sid, rid, **kw):
+        payload = {"source_id": sid, "track": 0, "duration": 2.0, "audio_streams": 1}
+        payload.update(kw)
+        manifest.atomic_write_json(
+            manifest.run_artifact(sid, rid, manifest.AUDIO_INFO), payload)
+
+    def test_audio_nan_duration_rejected(self):
+        sid, rid = self._prepare([0, 1], [0, 1])
+        self._bad_audio(sid, rid, duration=float("nan"))
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("duration", why)
+
+    def test_audio_negative_streams_rejected(self):
+        sid, rid = self._prepare([0, 1], [0, 1])
+        self._bad_audio(sid, rid, audio_streams=-1)
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("audio_streams", why)
+
+    def test_audio_track_out_of_range_rejected(self):
+        sid, rid = self._prepare([0, 1], [0, 1])
+        self._bad_audio(sid, rid, track=1, audio_streams=1)
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("超出", why)
+
+    def test_audio_duration_mismatch_rejected(self):
+        """audio.json 说 99 秒、转写说 2 秒：音频被换过了。"""
+        sid, rid = self._prepare([0, 1], [0, 1])
+        self._bad_audio(sid, rid, duration=99.0)
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("不一致", why)
+
+    def test_bad_wav_rejected(self):
+        sid, rid = self._prepare([0, 1], [0, 1])
+        write_bad_wav(manifest.run_artifact(sid, rid, manifest.AUDIO_WAV))
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("WAV", why)
+
     def test_missing_audio_rejected(self):
         sid, rid = self._prepare([0, 1], [0, 1])
         os.remove(manifest.run_artifact(sid, rid, manifest.AUDIO_WAV))
@@ -409,7 +454,7 @@ class TestSelection(ManifestCase):
         sid = manifest.source_id(p)
         os.makedirs(manifest.job_dir(sid), exist_ok=True)
         rid = manifest.new_run(sid, src)
-        put_audio(self, sid, rid)
+        put_audio(self, sid, rid, seconds=3.0)
         segs = [{"id": i, "start": i, "end": i + 1, "text": f"t{i}"} for i in (0, 1, 2)]
         manifest.atomic_write_json(
             manifest.run_artifact(sid, rid, manifest.TRANSCRIPT),

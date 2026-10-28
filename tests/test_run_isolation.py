@@ -14,6 +14,8 @@ import unittest
 
 from core import manifest, paths
 
+from tests.helpers import write_silence
+
 
 def make_two_track_video(path, seconds=2):
     r = subprocess.run([
@@ -139,8 +141,7 @@ class TestActiveRunSurvivesFailure(unittest.TestCase):
         np.savez(manifest.run_artifact(sid, rid, manifest.EMBEDDINGS),
                  emb=np.ones((1, 192), dtype=np.float32), ids=np.array([0]))
         wav = manifest.run_artifact(sid, rid, manifest.AUDIO_WAV)
-        with open(wav, "wb") as f:
-            f.write(b"RIFF" + b"\0" * 64)
+        write_silence(wav, seconds=0.2)
         manifest.save_audio_info(sid, rid, sid, track, 1.0, 1)
         ok, why = manifest.finalize_run(sid, rid)
         self.assertTrue(ok, why)

@@ -106,7 +106,7 @@ class MainWindow(QMainWindow):
         self._scroll_pending = False
         self.track_mismatch = False
 
-        self.queue_items = queue.load()
+        self.queue_settings, self.queue_items = queue.load_state()
         self.queue_running = False
         self.queue_i = 0
         self.current_item_id = ""
@@ -518,6 +518,12 @@ class MainWindow(QMainWindow):
             b.clicked.connect(slot)
             bar.addWidget(b)
             self.queue_edit_buttons.append(b)
+        self.btn_resync = QPushButton("更新源")
+        self.btn_resync.setFixedWidth(68)
+        self.btn_resync.setToolTip("源文件被替换后，把条目更新为当前文件的身份")
+        self.btn_resync.clicked.connect(self.update_queue_source)
+        bar.addWidget(self.btn_resync)
+        self.queue_edit_buttons.append(self.btn_resync)
         bar.addStretch(1)
         v.addLayout(bar)
 
@@ -549,7 +555,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(7)
         row.addWidget(QLabel("队列输出目录"))
-        self.queue_out = QLineEdit(paths.OUTPUT)
+        self.queue_out = QLineEdit(self.queue_settings.get("out_dir") or paths.OUTPUT)
         self.queue_out.setToolTip("开始队列时应用到所有未完成条目；已完成的不变")
         self.queue_out.textChanged.connect(lambda _t: self._refresh_queue())
         row.addWidget(self.queue_out, 1)
@@ -672,9 +678,30 @@ class MainWindow(QMainWindow):
         self._persist_queue()
         self._refresh_queue()
 
+    def update_queue_source(self):
+        """把选中条目更新为当前文件的身份（源文件被替换后使用）。"""
+        if self._queue_locked():
+            return
+        r = self._queue_row()
+        if not 0 <= r < len(self.queue_items):
+            QMessageBox.information(self, "提示", "先在表格里选一条任务。")
+            return
+        item = self.queue_items[r]
+        old, new = queue.refresh_source(item)
+        if not new:
+            QMessageBox.warning(self, "提示", "源文件不存在或无法读取，未更新。")
+            return
+        item["status"] = queue.WAITING
+        item["message"] = "已更新为当前文件"
+        self._persist_queue()
+        self._refresh_queue()
+        self.append_log(
+            f"[队列] {os.path.basename(item['video'])} 源身份已更新："
+            f"{(old or '').rsplit('-', 1)[-1][:8] or '无'} → {new.rsplit('-', 1)[-1][:8]}")
+
     def _persist_queue(self):
         try:
-            queue.save(self.queue_items)
+            queue.save(self.queue_items, out_dir=self.queue_out.text().strip())
         except Exception as e:
             self.append_log(f"队列保存失败：{e}")
 
@@ -683,7 +710,8 @@ class MainWindow(QMainWindow):
         t.setUpdatesEnabled(False)
         t.setRowCount(len(self.queue_items))
         colors = {queue.DONE: "#5dcaa5", queue.FAILED: "#e0736a",
-                  queue.RUNNING: "#c9a227", queue.CANCELLED: "#8a8880"}
+                  queue.RUNNING: "#c9a227", queue.CANCELLED: "#8a8880",
+                  queue.SKIPPED: "#8a8880"}
         out_dir = self.queue_out.text().strip()
         for r, item in enumerate(self.queue_items):
             t.setItem(r, 0, QTableWidgetItem(os.path.basename(item["video"])))
@@ -699,16 +727,31 @@ class MainWindow(QMainWindow):
             name = QTableWidgetItem(os.path.basename(queue.output_path(item)))
             name.setToolTip(queue.output_path(item))
             t.setItem(r, 4, name)
-            t.setItem(r, 5, QTableWidgetItem(item.get("message") or ""))
+
+            note = item.get("message") or ""
+            if item["status"] != queue.DONE:
+                state, why = queue.source_check(item)  # 快速：只比大小和 mtime
+                if state in ("changed", "missing"):
+                    note = why
+                    st.setForeground(QColor("#e0736a"))
+            elif queue.artifact_state(item) != "complete":
+                # 标记完成但产物不在了：状态列直接写"待重建"，别让人以为文件还在
+                st.setText("待重建")
+                st.setForeground(QColor("#c9a227"))
+                note = "产物缺失，开始队列时会重新生成"
+            t.setItem(r, 5, QTableWidgetItem(note))
         t.setUpdatesEnabled(True)
 
-        pending = [i for i in self.queue_items if i["status"] != queue.DONE]
+        pending = [i for i in self.queue_items if i["status"] not in (queue.DONE, queue.SKIPPED)]
         stale = sum(1 for i in pending
                     if out_dir and os.path.normcase(os.path.abspath(i.get("out_dir") or ""))
                     != os.path.normcase(os.path.abspath(out_dir)))
         bits = [f"共 {len(self.queue_items)} 条",
                 f"完成 {sum(1 for i in self.queue_items if i['status'] == queue.DONE)}",
                 f"失败 {sum(1 for i in self.queue_items if i['status'] == queue.FAILED)}"]
+        skipped = sum(1 for i in self.queue_items if i["status"] == queue.SKIPPED)
+        if skipped:
+            bits.append(f"跳过 {skipped}")
         if stale:
             bits.append(f"{stale} 条待运行时会改到当前目录")
         self.queue_label.setText(" · ".join(bits))
@@ -729,6 +772,46 @@ class MainWindow(QMainWindow):
             + "\n".join(lines))
         return False
 
+    def _check_sources(self, items):
+        """启动前逐个复核源文件身份，返回不可执行的条目。"""
+        bad = []
+        for item in items:
+            state, why = queue.source_check(item, deep=True)
+            if state == "ok":
+                continue
+            if state == "changed" and item.get("source"):
+                # 内容没变只是时间戳被动过：静默刷新记录，继续执行
+                old, new = queue.refresh_source(item)
+                if new and new == old:
+                    item["message"] = "源文件时间戳更新"
+                    continue
+            bad.append((item, why or state))
+        return bad
+
+    def _ask_overwrite(self, hits):
+        """已有目标文件时让用户明确选择，默认不覆盖。"""
+        lines = []
+        for item, paths in hits[:8]:
+            lines.append(f"{os.path.basename(item['video'])}（{item.get('role')}）："
+                         + "、".join(os.path.basename(p) for p in paths))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("目标文件已存在")
+        box.setText(f"{len(hits)} 条任务的目标文件已经存在，请选择处理方式：")
+        box.setInformativeText("跳过：保留现有文件，这些条目不执行。\n"
+                               "覆盖：删除并重新生成（不可撤销）。")
+        box.setDetailedText("\n".join(lines))
+        b_skip = box.addButton("跳过已存在", QMessageBox.AcceptRole)
+        b_over = box.addButton("覆盖", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_skip:
+            return queue.SKIP
+        if clicked is b_over:
+            return queue.OVERWRITE
+        return None
+
     def start_queue(self):
         if self.queue_running or self.runner.running():
             return
@@ -740,15 +823,58 @@ class MainWindow(QMainWindow):
         changed = queue.apply_out_dir(self.queue_items, self.queue_out.text().strip()
                                       or paths.OUTPUT)
         for item in self.queue_items:
-            if item["status"] != queue.DONE:
+            if item["status"] in (queue.FAILED, queue.CANCELLED, queue.SKIPPED):
                 item["status"] = queue.WAITING
                 item["message"] = ""
+        fixed = queue.audit_done(self.queue_items)
+        for item, why in fixed:
+            self.append_log(f"[队列] {os.path.basename(item['video'])} 的产物已失效（{why}），重新排队")
+
+        runnable = [i for i in self.queue_items if i["status"] != queue.DONE]
+        if not runnable:
+            self._persist_queue()
+            self._refresh_queue()
+            QMessageBox.information(self, "提示", "没有待执行的任务，全部已完成。")
+            return
+
+        bad = self._check_sources(runnable)
+        if bad:
+            self._persist_queue()
+            self._refresh_queue()
+            detail = "\n".join(f"{os.path.basename(i['video'])}：{w}" for i, w in bad[:8])
+            self.append_log("[队列] 源文件已变化，已阻止启动：" + "；".join(detail.splitlines()))
+            QMessageBox.warning(
+                self, "源文件已变化",
+                "以下条目的源文件与加入队列时不一致，不会执行：\n\n" + detail
+                + "\n\n如果确认要用新文件，选中该行点「更新源」；否则请把原文件放回。")
+            return
+
         self._persist_queue()
         self._refresh_queue()
         if changed:
             self.append_log(f"[队列] 输出目录已应用到 {changed} 条待运行任务")
         if not self._queue_conflicts():
             return
+
+        hits = queue.existing_targets(runnable)
+        if hits:
+            policy = self._ask_overwrite(hits)
+            if policy is None:
+                self.append_log("[队列] 目标文件已存在，用户取消了启动")
+                return
+            if policy == queue.SKIP:
+                for item, _paths in hits:
+                    item["status"] = queue.SKIPPED
+                    item["message"] = "目标文件已存在，已跳过"
+                runnable = [i for i in runnable if i["status"] != queue.SKIPPED]
+                self.append_log(f"[队列] 跳过 {len(hits)} 条已存在目标的任务")
+                self._persist_queue()
+                self._refresh_queue()
+                if not runnable:
+                    QMessageBox.information(self, "提示", "所有任务的目标文件都已存在，没有需要执行的。")
+                    return
+            else:
+                self.append_log(f"[队列] 用户选择覆盖 {len(hits)} 条任务的已有产物")
 
         self.queue_running = True
         self.queue_i = 0
@@ -768,7 +894,16 @@ class MainWindow(QMainWindow):
     def _run_next_queue_item(self):
         while self.queue_i < len(self.queue_items):
             item = self.queue_items[self.queue_i]
-            if item["status"] == queue.DONE:
+            if item["status"] in (queue.DONE, queue.SKIPPED):
+                self.queue_i += 1
+                continue
+            state, why = queue.source_check(item, deep=True)
+            if state != "ok":
+                item["status"] = queue.FAILED
+                item["message"] = f"源文件已变化（{why}），未执行"
+                self.append_log(f"[队列] {os.path.basename(item['video'])} 跳过：{why}")
+                self._persist_queue()
+                self._refresh_queue()
                 self.queue_i += 1
                 continue
             steps = queue.build_steps(item)

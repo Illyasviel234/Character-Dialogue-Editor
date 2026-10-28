@@ -13,6 +13,8 @@ import numpy as np
 
 from core import manifest, paths, queue
 
+from tests.helpers import write_silence, write_text, write_tiny_video
+
 
 def make_video(directory, name="v.mp4", data=b"v" * 300):
     path = os.path.join(directory, name)
@@ -35,8 +37,7 @@ def complete_run(video, track=0):
     np.savez(manifest.run_artifact(sid, rid, manifest.EMBEDDINGS),
              emb=np.ones((2, 192), dtype=np.float32), ids=np.array([0, 1]))
     wav = manifest.run_artifact(sid, rid, manifest.AUDIO_WAV)
-    with open(wav, "wb") as f:
-        f.write(b"RIFF" + b"\0" * 64)
+    write_silence(wav, seconds=0.2)
     manifest.save_audio_info(sid, rid, sid, track, 2.0, 1)
     ok, why = manifest.finalize_run(sid, rid)
     assert ok, why
@@ -236,3 +237,161 @@ class TestPersistence(QueueCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSourceIdentity(QueueCase):
+    """入队时冻结源身份，替换文件后不能静默处理新内容。"""
+
+    def _item(self, name="ep.mp4", data=b"v" * 300, role="R"):
+        return queue.make_item(make_video(self.tmp.name, name, data), role=role)
+
+    def test_identity_frozen_at_enqueue(self):
+        item = self._item()
+        src = item["source"]
+        self.assertTrue(src.get("id"))
+        self.assertEqual(len(src["fingerprint"]), 16)
+        self.assertEqual(src["size"], 300)
+        self.assertTrue(src["mtime"])
+
+    def test_output_name_uses_frozen_fingerprint(self):
+        item = self._item()
+        before = queue.base_name(item)
+        # 同路径换成不同内容
+        with open(item["video"], "wb") as f:
+            f.write(b"w" * 300)
+        self.assertEqual(queue.base_name(item), before,
+                         "输出名不能跟着当前文件变，否则用户看不出处理的是哪份素材")
+
+    def test_detects_replacement(self):
+        """同大小、同秒级 mtime 的内容替换只能靠深度检查发现。"""
+        item = self._item()
+        with open(item["video"], "wb") as f:
+            f.write(b"w" * 300)
+        state, why = queue.source_check(item, deep=True)
+        self.assertEqual(state, "changed")
+        self.assertIn("内容", why)
+
+    def test_fast_check_detects_size_change(self):
+        item = self._item()
+        with open(item["video"], "wb") as f:
+            f.write(b"w" * 400)
+        self.assertEqual(queue.source_check(item)[0], "changed")
+
+    def test_detects_missing(self):
+        item = self._item()
+        os.remove(item["video"])
+        self.assertEqual(queue.source_check(item)[0], "missing")
+        self.assertEqual(queue.source_check(item, deep=True)[0], "missing")
+
+    def test_touch_only_passes_deep_check(self):
+        """只改 mtime、内容没变：快速检查报警，深度检查放行。"""
+        item = self._item()
+        os.utime(item["video"], (1700000000, 1700000000))
+        self.assertEqual(queue.source_check(item)[0], "changed")
+        self.assertEqual(queue.source_check(item, deep=True)[0], "ok")
+
+    def test_refresh_source_updates_identity(self):
+        item = self._item()
+        old = item["source"]["id"]
+        with open(item["video"], "wb") as f:
+            f.write(b"w" * 400)
+        before, after = queue.refresh_source(item)
+        self.assertEqual(before, old)
+        self.assertNotEqual(after, old)
+        self.assertEqual(queue.source_check(item, deep=True)[0], "ok")
+
+    def test_old_item_without_identity(self):
+        item = self._item()
+        item["source"] = {}
+        self.assertEqual(queue.source_check(item)[0], "unknown")
+
+
+class TestArtifacts(QueueCase):
+    """已完成条目的产物要能复核，缺了就退回等待。"""
+
+    def _done_item(self):
+        item = queue.make_item(make_video(self.tmp.name, "a.mp4"), role="R",
+                               out_dir=self.tmp.name)
+        paths = queue.targets(item)
+        if not write_tiny_video(paths["video"]):
+            self.skipTest("ffmpeg 不可用")
+        write_text(paths["csv"],
+                   "序号,原片起点,原片终点,时长(秒),相似度,台词\n"
+                   "1,00:10.00,00:13.50,3.5,0.842,テスト\n")
+        write_text(paths["html"], "<html>" + "x" * 200 + "</html>")
+        item["status"] = queue.DONE
+        return item, paths
+
+    def test_artifact_state_complete(self):
+        item, _ = self._done_item()
+        self.assertEqual(queue.artifact_state(item), "complete")
+
+    def test_artifact_state_partial(self):
+        item, paths = self._done_item()
+        os.remove(paths["html"])
+        self.assertEqual(queue.artifact_state(item), "partial")
+
+    def test_health_ok(self):
+        item, _ = self._done_item()
+        ok, why = queue.target_health(item)
+        self.assertTrue(ok, why)
+
+    def test_health_rejects_corrupt_clip(self):
+        item, paths = self._done_item()
+        with open(paths["video"], "wb") as f:
+            f.write(b"not a video")
+        ok, why = queue.target_health(item)
+        self.assertFalse(ok)
+        self.assertIn("播放", why)
+
+    def test_audit_resets_missing_clip(self):
+        item, paths = self._done_item()
+        os.remove(paths["video"])
+        fixed = queue.audit_done([item])
+        self.assertEqual(len(fixed), 1)
+        self.assertEqual(item["status"], queue.WAITING)
+        self.assertIn("成片", item["message"])
+
+    def test_audit_keeps_healthy(self):
+        item, _ = self._done_item()
+        self.assertEqual(queue.audit_done([item]), [])
+        self.assertEqual(item["status"], queue.DONE)
+
+    def test_existing_targets_lists_hits(self):
+        item, paths = self._done_item()
+        hits = queue.existing_targets([item])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(set(hits[0][1]), set(paths.values()))
+
+
+class TestSettingsAndIds(QueueCase):
+    def test_out_dir_persisted(self):
+        items = [queue.make_item(make_video(self.tmp.name), role="R")]
+        target = os.path.join(self.tmp.name, "out2")
+        queue.save(items, out_dir=target)
+        settings, back = queue.load_state()
+        self.assertEqual(settings["out_dir"], target)
+        self.assertEqual(len(back), 1)
+
+    def test_duplicate_ids_regenerated(self):
+        with open(queue.queue_path(), "w", encoding="utf-8") as f:
+            json.dump({"items": [{"video": "a.mp4", "id": "same"},
+                                 {"video": "b.mp4", "id": "same"}]}, f)
+        items = queue.load()
+        ids = [i["id"] for i in items]
+        self.assertEqual(len(set(ids)), 2)
+        self.assertNotIn("same", ids, "长度不对的 id 也要换掉")
+
+    def test_save_fixes_duplicates(self):
+        a = queue.make_item(make_video(self.tmp.name, "a.mp4"))
+        b = queue.make_item(make_video(self.tmp.name, "b.mp4"))
+        b["id"] = a["id"]
+        queue.save([a, b])
+        back = queue.load()
+        self.assertEqual(len({i["id"] for i in back}), 2)
+
+    def test_missing_source_record_survives_roundtrip(self):
+        item = queue.make_item(make_video(self.tmp.name), role="R")
+        queue.save([item])
+        back = queue.load()[0]
+        self.assertEqual(back["source"]["id"], item["source"]["id"])
