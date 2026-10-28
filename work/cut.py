@@ -132,7 +132,7 @@ def main():
     p.add_argument("--out-dir", default=None,
                    help="成片输出目录，默认 output/；指定 --output 时忽略")
     p.add_argument("--audio-track", type=int, default=None,
-                   help="用第几条音轨（从 0 开始），默认沿用切点方案记录的音轨")
+                   help="必须与分析所用音轨一致；换音轨请重新分析")
     p.add_argument("--vfr", default="cfr", choices=("cfr", "preserve"),
                    help="cfr 转恒定帧率（默认，时长可控）；preserve 保留源时间戳")
     args = p.parse_args()
@@ -164,9 +164,12 @@ def main():
     src = media.probe(video)
     has_audio = bool(src.get("audio_streams"))
     streams = int(src.get("audio_streams") or 0)
-    track = args.audio_track
-    if track is None:
-        track = int(sel.get("audio_track", manifest.audio_track(sid)))
+    # 音轨由活动运行决定：时间码和声纹都来自那条音轨，导出必须跟着它
+    track = manifest.run_audio_track(sid)
+    if args.audio_track is not None and int(args.audio_track) != track:
+        sys.exit(f"--audio-track {args.audio_track} 与分析所用音轨 {track} 不一致。\n"
+                 f"换音轨必须重新分析（extract_audio.py --audio-track {args.audio_track}），"
+                 f"否则时间码与声纹来自另一条音轨。")
     if has_audio and not 0 <= track < streams:
         sys.exit(f"音轨 {track} 不存在，该视频共 {streams} 条（0–{streams - 1}）")
 

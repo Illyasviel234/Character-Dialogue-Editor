@@ -14,6 +14,16 @@ def write(path, data=b"x" * 100):
     return path
 
 
+def put_audio(case, sid, rid, track=0, seconds=10.0):
+    """在 run 目录里放一份占位音频与 audio.json。"""
+    wav = manifest.run_artifact(sid, rid, manifest.AUDIO_WAV)
+    os.makedirs(os.path.dirname(wav), exist_ok=True)
+    with open(wav, "wb") as f:
+        f.write(b"RIFF" + b"\0" * 64)
+    manifest.save_audio_info(sid, rid, sid, track, seconds, 1)
+    return wav
+
+
 def src_with_fp(path):
     st = os.stat(path)
     return {"size": st.st_size, "duration": 10.0,
@@ -83,6 +93,24 @@ class TestFingerprint(ManifestCase):
         write(p, b"2" * 500)
         self.assertNotEqual(manifest.fingerprint(p), first)
 
+    def test_cache_assumes_metadata(self):
+        """同路径、同大小、同 mtime 但内容变了：缓存仍返回旧摘要。
+
+        这是有意的取舍——每次切换视频都全量重算 788 MB 不划算。
+        需要强制重算时用 clear_cache() 或 fingerprint(cache=False)，
+        migrate_jobs.py --rehash 就是走这条路。
+        """
+        p = self.file("same.mp4", b"1" * 400)
+        first = manifest.fingerprint(p)
+        st = os.stat(p)
+        with open(p, "wb") as f:
+            f.write(b"2" * 400)
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))  # 把 mtime 改回去
+        self.assertEqual(manifest.fingerprint(p), first, "缓存应命中旧摘要")
+        self.assertNotEqual(manifest.fingerprint(p, cache=False), first, "绕过缓存必须重算")
+        manifest.clear_cache()
+        self.assertNotEqual(manifest.fingerprint(p), first, "清缓存后应重算")
+
     def test_cache_bypass_matches(self):
         p = self.file("d.mp4", b"1" * 500)
         self.assertEqual(manifest.fingerprint(p), manifest.fingerprint(p, cache=False))
@@ -138,6 +166,7 @@ class TestRunLifecycle(ManifestCase):
         sid = manifest.source_id(p)
         os.makedirs(manifest.job_dir(sid), exist_ok=True)
         rid = manifest.new_run(sid, src, model="large-v3", device="cpu")
+        put_audio(self, sid, rid)
 
         segs = [{"id": i, "start": i, "end": i + 1, "text": f"t{i}"} for i in seg_ids]
         manifest.atomic_write_json(
@@ -274,14 +303,13 @@ class TestRunLifecycle(ManifestCase):
 
     def test_audio_track_match_ok(self):
         sid, rid = self._prepare([0, 1], [0, 1])
-        manifest.save_audio_info(sid, sid, 0, 2.0, 2)
         ok, why = manifest.finalize_run(sid, rid)
         self.assertTrue(ok, why)
 
     def test_audio_track_mismatch_rejected(self):
         """音频换成第 2 条音轨后，用第 1 条音频做的运行不能再提交。"""
         sid, rid = self._prepare([0, 1], [0, 1])
-        manifest.save_audio_info(sid, sid, 1, 2.0, 2)
+        manifest.save_audio_info(sid, rid, sid, 1, 2.0, 2)
         ok, why = manifest.finalize_run(sid, rid)
         self.assertFalse(ok)
         self.assertIn("音轨", why)
@@ -289,7 +317,15 @@ class TestRunLifecycle(ManifestCase):
 
     def test_audio_from_other_source_rejected(self):
         sid, rid = self._prepare([0, 1], [0, 1])
-        manifest.save_audio_info(sid, "other-1234", 0, 2.0, 1)
+        manifest.save_audio_info(sid, rid, "other-1234", 0, 2.0, 1)
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("音频", why)
+
+    def test_missing_audio_rejected(self):
+        sid, rid = self._prepare([0, 1], [0, 1])
+        os.remove(manifest.run_artifact(sid, rid, manifest.AUDIO_WAV))
+        os.remove(manifest.run_artifact(sid, rid, manifest.AUDIO_INFO))
         ok, why = manifest.finalize_run(sid, rid)
         self.assertFalse(ok)
         self.assertIn("音频", why)
@@ -317,8 +353,26 @@ class TestLabels(ManifestCase):
         sid = manifest.source_id(p)
         os.makedirs(manifest.job_dir(sid), exist_ok=True)
         self.assertEqual(manifest.audio_track(sid), 0)
-        manifest.save_audio_info(sid, sid, 1, 12.5, 2)
-        self.assertEqual(manifest.audio_track(sid), 1)
+        rid = manifest.new_run(sid, {"size": 1, "duration": 1.0, "fingerprint": "x"},
+                               audio_track=1)
+        put_audio(self, sid, rid, track=1)
+        self.assertEqual(manifest.load_audio_info(sid, rid)["track"], 1)
+        self.assertEqual(manifest.run_audio_track(sid, rid), 1)
+        self.assertTrue(manifest.audio_path(sid, rid).endswith(manifest.AUDIO_WAV))
+
+    def test_legacy_job_audio_still_read(self):
+        """旧布局的任务级音频仍要能读到，否则老任务一升级就听不了。"""
+        p = self.file("v.mp4", b"v" * 200)
+        sid = manifest.source_id(p)
+        os.makedirs(manifest.job_dir(sid), exist_ok=True)
+        rid = manifest.new_run(sid, {"size": 1, "duration": 1.0, "fingerprint": "x"})
+        legacy = manifest.artifact(sid, manifest.AUDIO_WAV)
+        with open(legacy, "wb") as f:
+            f.write(b"RIFF" + b"\0" * 64)
+        manifest.atomic_write_json(manifest.artifact(sid, manifest.AUDIO_INFO),
+                                   {"track": 0, "source_id": sid})
+        self.assertEqual(manifest.audio_path(sid, rid), legacy)
+        self.assertEqual(manifest.load_audio_info(sid, rid)["track"], 0)
 
 
 class TestSelection(ManifestCase):
@@ -330,6 +384,7 @@ class TestSelection(ManifestCase):
         sid = manifest.source_id(p)
         os.makedirs(manifest.job_dir(sid), exist_ok=True)
         rid = manifest.new_run(sid, src)
+        put_audio(self, sid, rid)
         segs = [{"id": i, "start": i, "end": i + 1, "text": f"t{i}"} for i in (0, 1, 2)]
         manifest.atomic_write_json(
             manifest.run_artifact(sid, rid, manifest.TRANSCRIPT),
@@ -339,8 +394,10 @@ class TestSelection(ManifestCase):
         ok, why = manifest.finalize_run(sid, rid)
         self.assertTrue(ok, why)
         sel = {
+            "schema": manifest.SELECTION_SCHEMA,
             "source_id": sid,
             "run_id": rid,
+            "audio_track": 0,
             "source": dict(src),
             "segments": [{"start": 0.0, "end": 1.5, "dur": 1.5, "ids": [0], "lines": ["a"]}],
         }
@@ -382,6 +439,7 @@ class TestSelection(ManifestCase):
     def test_out_of_range_rejected(self):
         sid, _rid, src, sel = self._ready()
         sel["segments"][0]["end"] = 999.0
+        sel["segments"][0]["dur"] = 999.0
         ok, why = manifest.validate_selection(sid, sel, src)
         self.assertFalse(ok)
         self.assertIn("超出", why)
@@ -393,12 +451,70 @@ class TestSelection(ManifestCase):
         self.assertFalse(ok)
         self.assertIn("台词编号", why)
 
+    def test_audio_track_mismatch_rejected(self):
+        """selection 用第 2 条音轨，分析用的是第 1 条：时间码和声纹对不上。"""
+        sid, _rid, src, sel = self._ready()
+        sel["audio_track"] = 1
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("音轨", why)
+
+    def test_missing_audio_track_rejected(self):
+        sid, _rid, src, sel = self._ready()
+        sel.pop("audio_track")
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("音轨", why)
+
+    def test_old_schema_rejected(self):
+        sid, _rid, src, sel = self._ready()
+        sel.pop("schema")
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("版本", why)
+
+    def test_missing_source_id_rejected(self):
+        sid, _rid, src, sel = self._ready()
+        sel.pop("source_id")
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("源文件 ID", why)
+
+    def test_dur_mismatch_rejected(self):
+        sid, _rid, src, sel = self._ready()
+        sel["segments"][0]["dur"] = 999.0
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("时长字段", why)
+
+    def test_dur_nan_rejected(self):
+        sid, _rid, src, sel = self._ready()
+        sel["segments"][0]["dur"] = float("nan")
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("有限", why)
+
+    def test_dur_inf_rejected(self):
+        sid, _rid, src, sel = self._ready()
+        sel["segments"][0]["end"] = float("inf")
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("有限", why)
+
+    def test_negative_dur_rejected(self):
+        sid, _rid, src, sel = self._ready()
+        sel["segments"][0].update({"start": 1.0, "end": 0.5, "dur": -0.5})
+        ok, why = manifest.validate_selection(sid, sel, src)
+        self.assertFalse(ok)
+        self.assertIn("时间非法", why)
+
     def test_no_active_run_rejected(self):
         p = self.file("w.mp4", b"w" * 200)
         src = src_with_fp(p)
         sid = manifest.source_id(p)
         os.makedirs(manifest.job_dir(sid), exist_ok=True)
-        sel = {"source_id": sid, "run_id": "x",
+        sel = {"schema": manifest.SELECTION_SCHEMA, "source_id": sid, "run_id": "x",
+               "audio_track": 0,
                "segments": [{"start": 0, "end": 1, "dur": 1, "ids": [0]}]}
         ok, why = manifest.validate_selection(sid, sel, src)
         self.assertFalse(ok)

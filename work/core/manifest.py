@@ -15,6 +15,7 @@
 
 import hashlib
 import json
+import math
 import os
 import secrets
 
@@ -25,9 +26,14 @@ MANIFEST = "manifest.json"
 TRANSCRIPT = "transcript.json"
 EMBEDDINGS = "embeddings.npz"
 SELECTED = "selected.json"
-AUDIO = "audio.json"
+AUDIO_WAV = "audio16k.wav"
+AUDIO_INFO = "audio.json"
 LABELS = "labels.json"
 RUNS = "runs"
+
+# 切点方案的 schema。v2 起要求 schema/source_id/run_id/audio_track/source 必填，
+# 并把 dur 纳入校验；v1（无 schema 字段）会被明确拒绝，要求重新生成。
+SELECTION_SCHEMA = 2
 
 CHUNK = 4 * 1024 * 1024
 UNFINISHED = ("running", "transcribed")
@@ -92,11 +98,11 @@ def fingerprint(path, cache=True):
     return digest
 
 
-def source_id(path):
+def source_id(path, cache=True):
     """由文件名 + 内容指纹生成，同内容同 ID，不同内容必不同 ID。"""
     stem = os.path.splitext(os.path.basename(path))[0]
     safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in stem)[:40]
-    return f"{safe}-{fingerprint(path)}"
+    return f"{safe}-{fingerprint(path, cache=cache)}"
 
 
 def make_source(path, media):
@@ -173,20 +179,34 @@ def save_manifest(sid, data):
 
 # ---------- 音频音轨 ----------
 
-def load_audio_info(sid):
-    """extract_audio.py 写的旁注：这份 16k 音频来自第几条音轨。"""
-    path = artifact(sid, AUDIO)
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+def load_audio_info(sid, run_id=None):
+    """这份 16k 音频来自第几条音轨。
+
+    新布局把音频放进 runs/<run_id>/，与转写声纹同生命周期；旧任务只有
+    任务级的一份，找不到 run 内的就回退到任务级（只读，不再写入）。
+    """
+    for path in ((run_artifact(sid, run_id, AUDIO_INFO) if run_id else None),
+                 artifact(sid, AUDIO_INFO)):
+        if path and os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+    return {}
 
 
-def save_audio_info(sid, source_id, track, duration, streams):
-    atomic_write_json(artifact(sid, AUDIO), {
+def audio_path(sid, run_id=None):
+    """16k 音频的实际路径，找不到返回 None。"""
+    for path in ((run_artifact(sid, run_id, AUDIO_WAV) if run_id else None),
+                 artifact(sid, AUDIO_WAV)):
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def save_audio_info(sid, run_id, source_id, track, duration, streams):
+    atomic_write_json(run_artifact(sid, run_id, AUDIO_INFO), {
         "version": VERSION,
         "source_id": source_id,
         "track": int(track),
@@ -195,9 +215,18 @@ def save_audio_info(sid, source_id, track, duration, streams):
     })
 
 
+def run_audio_track(sid, run_id=None):
+    """某次运行实际使用的音轨号。优先运行记录，其次 audio.json，缺省 0。"""
+    rid = run_id or active_run(sid)
+    rec = ((load_manifest(sid) or {}).get("runs") or {}).get(rid) or {}
+    if "audio_track" in rec:
+        return int(rec["audio_track"])
+    return int(load_audio_info(sid, rid).get("track", 0))
+
+
 def audio_track(sid):
-    """当前 16k 音频所用的音轨号，缺省按第 0 条。"""
-    return int(load_audio_info(sid).get("track", 0))
+    """当前活动运行所用的音轨号，供界面与脚本对齐。"""
+    return run_audio_track(sid, active_run(sid))
 
 
 # ---------- 人工标注 ----------
@@ -322,7 +351,9 @@ def validate_run(sid, run_id):
         if tr.get("run_id") != run_id:
             return False, f"转写属于运行 {tr.get('run_id') or '未知'}，不是本次运行"
 
-        side = load_audio_info(sid)
+        if not audio_path(sid, run_id):
+            return False, "缺少 16k 音频，请重新抽取"
+        side = load_audio_info(sid, run_id)
         if side:
             if side.get("source_id") and side["source_id"] != sid:
                 return False, "音频属于其他源文件"
@@ -367,10 +398,18 @@ def validate_selection(sid, selected, source=None, active=None):
     重新分析成功后若没有重新筛选，selected.json 里还是旧 run 的台词和时间码。
     静默用它切片会得到"画面是新的、片段是旧的"这种最难发现的问题，
     因此这里直接拒绝，要求重新生成切点方案。
+
+    音轨也必须一致：时间码与声纹来自第 N 条音轨，导出却用第 M 条，
+    对白语言或混音不同时成片会与判断依据对不上。
     """
     if not selected:
         return False, "切点方案为空"
-    if selected.get("source_id") and selected["source_id"] != sid:
+    if int(selected.get("schema") or 0) != SELECTION_SCHEMA:
+        return False, (f"切点方案版本过旧（schema {selected.get('schema')}，"
+                       f"需要 {SELECTION_SCHEMA}），请重新生成")
+    if not selected.get("source_id"):
+        return False, "切点方案缺少源文件 ID，请重新生成"
+    if selected["source_id"] != sid:
         return False, "切点方案属于其他源文件"
 
     rid = active if active is not None else active_run(sid)
@@ -381,6 +420,14 @@ def validate_selection(sid, selected, source=None, active=None):
         return False, "切点方案没有记录运行 ID，请重新生成"
     if srid != rid:
         return False, f"切点方案来自旧运行 {srid}（当前 {rid}），请重新生成切点方案"
+
+    if "audio_track" not in selected:
+        return False, "切点方案没有记录音轨，请重新生成"
+    want = run_audio_track(sid, rid)
+    have = int(selected["audio_track"])
+    if have != want:
+        return False, (f"切点方案用的是第 {have + 1} 条音轨，当前分析用的是第 {want + 1} 条，"
+                       f"请重新生成切点方案")
 
     if source:
         old = (selected.get("source") or {}).get("fingerprint")
@@ -395,9 +442,19 @@ def validate_selection(sid, selected, source=None, active=None):
         return False, "切点方案为空"
     duration = float((source or selected.get("source") or {}).get("duration") or 0)
     for i, s in enumerate(segs, 1):
-        start, end = float(s.get("start", -1)), float(s.get("end", 0))
+        try:
+            start = float(s.get("start"))
+            end = float(s.get("end"))
+            dur = float(s.get("dur"))
+        except (TypeError, ValueError):
+            return False, f"第 {i} 段缺少时间字段"
+        if not all(map(math.isfinite, (start, end, dur))):
+            return False, f"第 {i} 段时间不是有限数值"
         if start < 0 or end <= start:
             return False, f"第 {i} 段时间非法（{start:.2f}–{end:.2f}）"
+        if dur <= 0 or abs(dur - (end - start)) > 1e-3:
+            return False, (f"第 {i} 段时长字段与区间不一致"
+                           f"（dur {dur:.3f} vs {end - start:.3f}）")
         if duration and end > duration + 0.5:
             return False, f"第 {i} 段超出源视频时长（{end:.2f} > {duration:.2f}）"
 

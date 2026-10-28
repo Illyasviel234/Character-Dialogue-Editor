@@ -103,10 +103,10 @@ def main():
         sys.exit("没有待完成的分析运行，请先运行 transcribe.py")
 
     tpath = manifest.run_artifact(sid, run_id, manifest.TRANSCRIPT)
-    apath = os.path.join(jdir, "audio16k.wav")
+    apath = manifest.audio_path(sid, run_id)
     if not os.path.exists(tpath):
         sys.exit(f"运行 {run_id} 缺少转写结果")
-    if not os.path.exists(apath):
+    if not apath:
         sys.exit("缺少 16k 音频，请先运行 extract_audio.py")
 
     with open(tpath, encoding="utf-8") as f:

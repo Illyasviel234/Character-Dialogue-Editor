@@ -75,9 +75,18 @@ def main():
     video = cli.resolve_video(args.video)
     sid, source, jdir, info = cli.prepare(video)
 
-    audio_path = args.audio or os.path.join(jdir, "audio16k.wav")
-    if not os.path.exists(audio_path):
-        sys.exit("缺少 16k 音频，请先运行 extract_audio.py")
+    # 抽音频阶段已经建好了运行，这里接续它；直接跑本脚本时新建一个并沿用旧布局的音频
+    run_id = args.run or manifest.pending_run(sid)
+    if run_id:
+        audio_path = manifest.run_artifact(sid, run_id, manifest.AUDIO_WAV)
+        if not os.path.exists(audio_path):
+            sys.exit(f"运行 {run_id} 缺少音频，请重新运行 extract_audio.py")
+    else:
+        run_id = manifest.new_run(sid, source, model=args.model, device=args.device,
+                                  audio_track=manifest.audio_track(sid))
+        audio_path = args.audio or manifest.audio_path(sid, run_id)
+        if not audio_path:
+            sys.exit("缺少 16k 音频，请先运行 extract_audio.py")
 
     sr, raw = wavfile.read(audio_path)
     if raw.ndim > 1:
@@ -85,9 +94,6 @@ def main():
     audio = raw.astype(np.float32) / 32768.0
     duration = len(audio) / float(sr or 16000)
     print(f"[ok] 音频 {duration:.1f}s", flush=True)
-
-    run_id = manifest.new_run(sid, source, model=args.model, device=args.device,
-                              audio_track=manifest.audio_track(sid))
     print(f"[run] {run_id}", flush=True)
 
     try:

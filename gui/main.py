@@ -10,13 +10,16 @@ import shutil
 import sys
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import (
+    QEvent, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal,
+)
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,7 +27,8 @@ WORK = os.path.join(ROOT, "work")
 sys.path.insert(0, WORK)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core import audio, manifest, media, naming, paths, scoring, segmenter  # noqa: E402
+from core import (audio, manifest, media, naming, paths, queue,  # noqa: E402
+                  scoring, segmenter)
 from audition import Player  # noqa: E402
 from runner import Runner, Step  # noqa: E402
 from theme import QSS  # noqa: E402
@@ -34,6 +38,30 @@ FRAME_MODES = {"转恒定帧率": "cfr", "保留源时间戳": "preserve"}
 FILTERS = ("全部", "阈值以上", "阈值附近", "仅勾选")
 SORTS = ("时间", "相似度", "时长", "勾选")
 VIDEO_EXT = (".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi")
+
+
+class _FrameSignals(QObject):
+    done = Signal(int, str)
+
+
+class _FrameJob(QRunnable):
+    """后台取帧。4K 素材单帧解码要几百毫秒，放在主线程会卡住上下键。"""
+
+    def __init__(self, signals, token, video, ts, dst):
+        super().__init__()
+        self.signals = signals
+        self.token = token
+        self.video = video
+        self.ts = ts
+        self.dst = dst
+
+    def run(self):
+        path = ""
+        try:
+            path = audio.grab_frame(self.video, self.ts, self.dst) or ""
+        except Exception:
+            path = ""
+        self.signals.done.emit(self.token, path)
 
 
 def local_models():
@@ -76,9 +104,21 @@ class MainWindow(QMainWindow):
         self._out_manual = False
         self._filling = False
         self._scroll_pending = False
+        self.track_mismatch = False
+
+        self.queue_items = queue.load()
+        self.queue_running = False
+        self.queue_i = 0
 
         self.player = Player(self)
         self.player.failed.connect(self.append_log)
+        self.player.finished.connect(self.on_audio_finished)
+
+        self._frame_pool = QThreadPool(self)
+        self._frame_pool.setMaxThreadCount(1)
+        self._frame_sig = _FrameSignals(self)
+        self._frame_sig.done.connect(self._on_frame_ready)
+        self._frame_token = 0
 
         self._sum_timer = QTimer(self)
         self._sum_timer.setSingleShot(True)
@@ -109,7 +149,15 @@ class MainWindow(QMainWindow):
 
         row.addWidget(self._build_left())
 
-        right = QVBoxLayout()
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_check_tab(), "逐句核对")
+        self.tabs.addTab(self._build_queue_tab(), "任务队列")
+        row.addWidget(self.tabs, 1)
+
+    def _build_check_tab(self):
+        page = QWidget()
+        right = QVBoxLayout(page)
+        right.setContentsMargins(8, 8, 8, 8)
         right.setSpacing(8)
         right.addLayout(self._build_toolbar())
 
@@ -146,10 +194,7 @@ class MainWindow(QMainWindow):
         split.setSizes([190, 500])
         right.addWidget(split, 1)
         right.addWidget(self._build_player())
-
-        holder = QWidget()
-        holder.setLayout(right)
-        row.addWidget(holder, 1)
+        return page
 
     def _build_left(self):
         content = QWidget()
@@ -448,6 +493,284 @@ class MainWindow(QMainWindow):
         lab.setWordWrap(True)
         return lab
 
+    # ---------- 任务队列 ----------
+
+    def _build_queue_tab(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(8)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(7)
+        self.btn_add = QPushButton("加入当前视频")
+        self.btn_add.setObjectName("primary")
+        self.btn_add.clicked.connect(self.add_to_queue)
+        bar.addWidget(self.btn_add)
+        for text, slot in (("上移", lambda: self.move_queue(-1)),
+                           ("下移", lambda: self.move_queue(1)),
+                           ("移除", self.remove_queue),
+                           ("清空", self.clear_queue)):
+            b = QPushButton(text)
+            b.setFixedWidth(58)
+            b.clicked.connect(slot)
+            bar.addWidget(b)
+        bar.addStretch(1)
+        v.addLayout(bar)
+
+        self.queue_table = QTableWidget(0, 5)
+        self.queue_table.setHorizontalHeaderLabels(["视频", "角色", "音轨", "状态", "说明"])
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setShowGrid(False)
+        self.queue_table.setAlternatingRowColors(True)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.queue_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.queue_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        qh = self.queue_table.horizontalHeader()
+        qh.setSectionResizeMode(0, QHeaderView.Stretch)
+        qh.setSectionResizeMode(1, QHeaderView.Fixed)
+        qh.setSectionResizeMode(2, QHeaderView.Fixed)
+        qh.setSectionResizeMode(3, QHeaderView.Fixed)
+        qh.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.queue_table.setColumnWidth(1, 110)
+        self.queue_table.setColumnWidth(2, 56)
+        self.queue_table.setColumnWidth(3, 72)
+        v.addWidget(self.queue_table, 1)
+
+        v.addWidget(self._hint(
+            "队列按顺序执行：没有分析结果的先分析，已有结果的直接切。"
+            "每条的参数取自加入队列时的界面设置，之后改界面不影响已排队的任务。"))
+
+        row = QHBoxLayout()
+        row.setSpacing(7)
+        row.addWidget(QLabel("输出目录"))
+        self.queue_out = QLineEdit(paths.OUTPUT)
+        self.queue_out.setToolTip("队列内所有成片的输出目录")
+        row.addWidget(self.queue_out, 1)
+        qbrowse = QPushButton("浏览")
+        qbrowse.setFixedWidth(58)
+        qbrowse.clicked.connect(self.pick_queue_dir)
+        row.addWidget(qbrowse)
+        v.addLayout(row)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(7)
+        self.btn_queue_start = QPushButton("开始队列")
+        self.btn_queue_start.setMinimumHeight(32)
+        self.btn_queue_start.clicked.connect(self.start_queue)
+        self.btn_queue_stop = QPushButton("停止")
+        self.btn_queue_stop.setFixedWidth(64)
+        self.btn_queue_stop.setMinimumHeight(32)
+        self.btn_queue_stop.setEnabled(False)
+        self.btn_queue_stop.clicked.connect(self.stop_queue)
+        row2.addWidget(self.btn_queue_start, 1)
+        row2.addWidget(self.btn_queue_stop)
+        v.addLayout(row2)
+
+        self.queue_label = QLabel("队列为空")
+        self.queue_label.setObjectName("hint")
+        v.addWidget(self.queue_label)
+
+        self._refresh_queue()
+        return page
+
+    def _current_item(self):
+        return dict(
+            role=(self.role_edit.text() or "目标角色").strip(),
+            keyword=self.kw_edit.text().strip(),
+            threshold=self.thr_spin.value(),
+            merge_gap=self.gap_spin.value(),
+            pad_head=self.pad_h.value(),
+            pad_tail=self.pad_t.value(),
+            audio_track=self.audio_track(),
+            scale=SCALES[self.scale_combo.currentText()],
+            crf=self.crf_spin.value(),
+            vfr=FRAME_MODES[self.frame_combo.currentText()],
+            model=self.model_combo.currentText(),
+            device=self.device_combo.currentText(),
+            out_dir=self.queue_out.text().strip() or paths.OUTPUT,
+        )
+
+    def add_to_queue(self):
+        if not self.video:
+            QMessageBox.warning(self, "提示", "请先选择视频。")
+            return
+        params = self._current_item()
+        for item in self.queue_items:
+            if (item["video"] == os.path.abspath(self.video)
+                    and item.get("role") == params["role"]):
+                QMessageBox.information(self, "已在队列中",
+                                        "同一个视频和角色已经排过队；要改参数可以先移除再加。")
+                return
+        self.queue_items.append(queue.make_item(self.video, **params))
+        self._persist_queue()
+        self._refresh_queue()
+        self.append_log(f"[队列] 已加入 {os.path.basename(self.video)} · {params['role']}")
+
+    def pick_queue_dir(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "选择队列输出目录", self.queue_out.text().strip() or paths.OUTPUT)
+        if d:
+            self.queue_out.setText(d)
+
+    def _queue_row(self):
+        return self.queue_table.currentRow()
+
+    def move_queue(self, delta):
+        r = self._queue_row()
+        t = r + delta
+        if r < 0 or not 0 <= t < len(self.queue_items):
+            return
+        self.queue_items[r], self.queue_items[t] = self.queue_items[t], self.queue_items[r]
+        self._persist_queue()
+        self._refresh_queue()
+        self.queue_table.selectRow(t)
+
+    def remove_queue(self):
+        r = self._queue_row()
+        if 0 <= r < len(self.queue_items):
+            if self.queue_items[r]["status"] == queue.RUNNING:
+                QMessageBox.information(self, "提示", "正在跑的任务不能移除，先点停止。")
+                return
+            self.queue_items.pop(r)
+            self._persist_queue()
+            self._refresh_queue()
+
+    def clear_queue(self):
+        if self.queue_running:
+            QMessageBox.information(self, "提示", "队列正在运行，先点停止。")
+            return
+        if not self.queue_items:
+            return
+        if QMessageBox.question(self, "确认清空",
+                                f"移除队列里全部 {len(self.queue_items)} 条任务？",
+                                QMessageBox.Yes | QMessageBox.No,
+                                QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.queue_items = []
+        self._persist_queue()
+        self._refresh_queue()
+
+    def _persist_queue(self):
+        try:
+            queue.save(self.queue_items)
+        except Exception as e:
+            self.append_log(f"队列保存失败：{e}")
+
+    def _refresh_queue(self):
+        t = self.queue_table
+        t.setUpdatesEnabled(False)
+        t.setRowCount(len(self.queue_items))
+        colors = {queue.DONE: "#5dcaa5", queue.FAILED: "#e0736a",
+                  queue.RUNNING: "#c9a227", queue.CANCELLED: "#8a8880"}
+        for r, item in enumerate(self.queue_items):
+            t.setItem(r, 0, QTableWidgetItem(os.path.basename(item["video"])))
+            t.setItem(r, 1, QTableWidgetItem(item.get("role") or ""))
+            t.setItem(r, 2, QTableWidgetItem(f"第 {int(item.get('audio_track', 0)) + 1} 条"))
+            st = QTableWidgetItem(item.get("status") or queue.WAITING)
+            st.setForeground(QColor(colors.get(item.get("status"), "#c9c7c0")))
+            t.setItem(r, 3, st)
+            t.setItem(r, 4, QTableWidgetItem(item.get("message") or ""))
+        t.setUpdatesEnabled(True)
+        self.queue_label.setText(
+            f"共 {len(self.queue_items)} 条 · "
+            f"完成 {sum(1 for i in self.queue_items if i['status'] == queue.DONE)} · "
+            f"失败 {sum(1 for i in self.queue_items if i['status'] == queue.FAILED)}")
+
+    def start_queue(self):
+        if self.queue_running or self.runner.running():
+            return
+        if not self.queue_items:
+            QMessageBox.warning(self, "提示", "队列为空，先把视频加入队列。")
+            return
+        for item in self.queue_items:
+            if item["status"] != queue.DONE:
+                item["status"] = queue.WAITING
+                item["message"] = ""
+        self._persist_queue()
+        self._refresh_queue()
+
+        self.queue_running = True
+        self.queue_i = 0
+        self.mode = "queue"
+        self.log_view.clear()
+        self.btn_queue_start.setEnabled(False)
+        self.btn_queue_stop.setEnabled(True)
+        self.btn_add.setEnabled(False)
+        self.progress.setValue(0)
+        self._run_next_queue_item()
+
+    def stop_queue(self):
+        if not self.queue_running:
+            return
+        self.queue_running = False
+        self.runner.cancel()
+
+    def _run_next_queue_item(self):
+        while self.queue_i < len(self.queue_items):
+            item = self.queue_items[self.queue_i]
+            if item["status"] == queue.DONE:
+                self.queue_i += 1
+                continue
+            steps = queue.build_steps(item)
+            need, why = queue.analysis_state(item)
+            item["status"] = queue.RUNNING
+            item["message"] = why
+            self._refresh_queue()
+            self.append_log(f"[队列 {self.queue_i + 1}/{len(self.queue_items)}] "
+                            f"{os.path.basename(item['video'])} · {item.get('role')} · {why}")
+            self.set_stage(f"队列 {self.queue_i + 1}/{len(self.queue_items)}："
+                           f"{os.path.basename(item['video'])}")
+            self.progress.setValue(0)
+            self.runner.start([Step(s, a, w, lab) for s, a, w, lab in steps], 100.0)
+            return
+        self._finish_queue()
+
+    def _finish_queue(self):
+        self._reset_queue_ui()
+        self.progress.setValue(100)
+        done = sum(1 for i in self.queue_items if i["status"] == queue.DONE)
+        failed = [i for i in self.queue_items if i["status"] == queue.FAILED]
+        self.set_stage("队列完成")
+        self.append_log(f"[队列] 完成 {done}/{len(self.queue_items)}"
+                        + (f"，失败 {len(failed)} 条" if failed else ""))
+        self._refresh_queue()
+
+    def _reset_queue_ui(self):
+        self.queue_running = False
+        self.mode = None
+        self.btn_queue_start.setEnabled(True)
+        self.btn_queue_stop.setEnabled(False)
+        self.btn_add.setEnabled(True)
+
+    def _abort_queue(self):
+        self._reset_queue_ui()
+        self.progress.setValue(0)
+        self.set_stage("队列已停止")
+        self.append_log("[队列] 已停止，未完成的任务保持原状")
+        self._refresh_queue()
+
+    def _finish_queue_item(self, ok, msg):
+        item = (self.queue_items[self.queue_i]
+                if self.queue_i < len(self.queue_items) else None)
+        if item is not None:
+            if ok:
+                item["status"] = queue.DONE
+                item["message"] = os.path.basename(queue.output_path(item))
+            elif "取消" in (msg or ""):
+                item["status"] = queue.CANCELLED
+                item["message"] = "已取消"
+            else:
+                item["status"] = queue.FAILED
+                item["message"] = msg
+        self._persist_queue()
+        self._refresh_queue()
+        self.queue_i += 1
+        if not self.queue_running:
+            self._abort_queue()
+            return
+        self._run_next_queue_item()
+
     # ---------- 输出路径 ----------
 
     def _default_output(self):
@@ -561,7 +884,7 @@ class MainWindow(QMainWindow):
         self.video_edit.setToolTip(path)
         self._refresh_output(force=True)
 
-        self.info = media.probe(path)
+        self.info = media.probe(path, deep=True)
         if not self.info:
             self.dur_label.setText("无法读取视频信息")
             self.track_combo.clear()
@@ -585,8 +908,14 @@ class MainWindow(QMainWindow):
         if self.info.get("is_vfr"):
             self.vfr_hint.setText(
                 f'源为可变帧率（r {self.info.get("fps"):.3f} / avg '
-                f'{self.info.get("avg_fps"):.3f}）。选「保留源时间戳」可维持原节奏，'
+                f'{self.info.get("avg_fps"):.3f}，帧间隔异常占比 '
+                f'{self.info.get("vfr_off", 0) * 100:.1f}%）。选「保留源时间戳」可维持原节奏，'
                 f'但时长偏差可能超过一帧。')
+            self.vfr_hint.setVisible(True)
+        elif self.info.get("vfr_verdict") == "unknown":
+            self.vfr_hint.setText(
+                "无法确认是否可变帧率（抽样帧不足）。若成片时长偏差偏大，"
+                "可以改选「保留源时间戳」再导一次。")
             self.vfr_hint.setVisible(True)
         else:
             self.vfr_hint.setVisible(False)
@@ -611,11 +940,27 @@ class MainWindow(QMainWindow):
     def _on_track_changed(self, index):
         if index < 0:
             return
-        have = manifest.audio_track(self.sid) if self.sid else 0
-        if index != have and self.run_id:
+        self._update_track_state()
+        if self.track_mismatch:
+            used = manifest.run_audio_track(self.sid, self.run_id)
             self.append_log(
-                f"音轨已切到第 {index + 1} 条，当前分析结果来自第 {have + 1} 条，"
-                f"需要重新点「开始分析」才能与画面一致。")
+                f"音轨已切到第 {index + 1} 条，当前分析结果来自第 {used + 1} 条。"
+                f"需要重新点「开始分析」；在此之前不能导出成片。")
+
+    def _update_track_state(self):
+        """音轨与分析结果不一致时锁住导出。
+
+        时间码和声纹都来自分析时那条音轨，导出却换一条，对白语言或混音
+        不同时成片会与判断依据对不上，所以宁可先不给导。
+        """
+        if not self.run_id or not self.sid:
+            self.track_mismatch = False
+        else:
+            used = manifest.run_audio_track(self.sid, self.run_id)
+            self.track_mismatch = self.audio_track() != used
+        self.btn_render.setEnabled(bool(self.segments) and not self.track_mismatch)
+        self.btn_render.setToolTip(
+            "当前音轨与分析所用音轨不一致，请重新分析" if self.track_mismatch else "")
 
     def audio_track(self):
         idx = self.track_combo.currentIndex()
@@ -644,6 +989,8 @@ class MainWindow(QMainWindow):
         self.btn_render.setEnabled(False)
         self.summary_label.setText("—")
         self.count_label.setText("")
+        self.track_mismatch = False
+        self._frame_token += 1
         self.thumb.setText("—")
         self.audio_time.setText("未选择台词")
         self.audio_text.setText("在表格里选一行，按空格试听")
@@ -822,7 +1169,7 @@ class MainWindow(QMainWindow):
         t.setUpdatesEnabled(True)
         self._filling = False
         self._scroll_pending = True
-        self.btn_render.setEnabled(bool(self.segments))
+        self._update_track_state()
         self.count_label.setText(
             f"{len(self.view)}/{len(self.segments)} 行 · 已选 {len(self.checked)} 句")
 
@@ -877,21 +1224,39 @@ class MainWindow(QMainWindow):
             return next((s for s in self.segments if s["id"] == sid), None)
         return None
 
-    def _audition_files(self, seg):
-        """切出单句音频、取一帧画面，都缓存在 work/.cache/audition/。"""
+    def _audition_dir(self):
         d = os.path.join(paths.CACHE, "audition", self.sid or "tmp")
-        wav = os.path.join(d, f"{seg['id']:04d}.wav")
-        png = os.path.join(d, f"{seg['id']:04d}.png")
-        if not (os.path.exists(wav) and os.path.getsize(wav) > 44):
-            src = os.path.join(manifest.job_dir(self.sid), "audio16k.wav")
-            if os.path.exists(src):
-                audio.slice_wav(src, seg["start"], seg["end"], wav, 0.05, 0.05)
-            else:
-                audio.extract_wav(self.video, seg["start"], seg["end"], wav,
-                                  self.audio_track())
-        if not os.path.exists(png):
-            audio.grab_frame(self.video, (seg["start"] + seg["end"]) / 2, png)
-        return wav, (png if os.path.exists(png) else None)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _audition_wav(self, seg):
+        """切出单句音频。只读活动运行自己的音频，未完成的新分析不会影响这里。"""
+        wav = os.path.join(self._audition_dir(), f"{seg['id']:04d}.wav")
+        if os.path.exists(wav) and os.path.getsize(wav) > 44:
+            return wav
+        src = manifest.audio_path(self.sid, self.run_id)
+        if src:
+            audio.slice_wav(src, seg["start"], seg["end"], wav, 0.05, 0.05)
+        else:
+            audio.extract_wav(self.video, seg["start"], seg["end"], wav,
+                              self.audio_track())
+        return wav
+
+    def _request_frame(self, seg):
+        """取帧放后台：4K 单帧解码几百毫秒，卡在主线程会让上下键发涩。"""
+        png = os.path.join(self._audition_dir(), f"{seg['id']:04d}.png")
+        if os.path.exists(png):
+            self._show_frame(png)
+            return
+        self._frame_token += 1
+        self._frame_pool.start(_FrameJob(
+            self._frame_sig, self._frame_token, self.video,
+            (seg["start"] + seg["end"]) / 2, png))
+
+    def _on_frame_ready(self, token, path):
+        if token != self._frame_token or not path:
+            return  # 用户已经移到别的行了，丢弃过期结果
+        self._show_frame(path)
 
     def _show_frame(self, png):
         pm = QPixmap(png)
@@ -916,13 +1281,7 @@ class MainWindow(QMainWindow):
         if not seg:
             return
         self._describe(seg)
-        try:
-            _wav, png = self._audition_files(seg)
-        except Exception as e:
-            self.append_log(f"预览失败：{e}")
-            return
-        if png:
-            self._show_frame(png)
+        self._request_frame(seg)
 
     def play_current(self):
         seg = self.current_segment()
@@ -935,18 +1294,21 @@ class MainWindow(QMainWindow):
         if loop is None:
             loop = self.loop_check.isChecked()
         try:
-            wav, png = self._audition_files(seg)
+            wav = self._audition_wav(seg)
         except Exception as e:
             self.append_log(f"试听失败：{e}")
             return
-        if png:
-            self._show_frame(png)
+        self._request_frame(seg)
         self._describe(seg)
         if self.player.play(wav, loop):
             self.btn_play.setText("暂停")
             self.audio_hint.setText(
                 f"正在播放{fmt_ts(seg['start'])}–{fmt_ts(seg['end'])}"
                 + ("（循环）" if loop else ""))
+
+    def on_audio_finished(self):
+        self.btn_play.setText("试听")
+        self.audio_hint.setText("空格 试听 · C 勾选 · L 循环 · Esc 停止")
 
     def toggle_play(self):
         if self.player.playing:
@@ -1018,8 +1380,11 @@ class MainWindow(QMainWindow):
 
     def _busy(self, busy):
         self.btn_analyze.setEnabled(not busy)
-        self.btn_render.setEnabled(not busy and bool(self.segments))
         self.btn_stop.setEnabled(busy)
+        if busy:
+            self.btn_render.setEnabled(False)
+        else:
+            self._update_track_state()
 
     def start_analysis(self):
         if not self.video or not os.path.exists(self.video):
@@ -1053,6 +1418,12 @@ class MainWindow(QMainWindow):
         if not self.run_id:
             QMessageBox.warning(self, "提示", "当前没有可用的分析运行，请先点「开始分析」。")
             return
+        if self.track_mismatch:
+            QMessageBox.warning(
+                self, "提示",
+                "当前选择的音轨与分析所用的音轨不一致。\n"
+                "请先按当前音轨重新分析，或把音轨切回分析时那一条。")
+            return
 
         segs = segmenter.build_segments(
             sorted(self.checked), self.segments, self.duration,
@@ -1072,7 +1443,9 @@ class MainWindow(QMainWindow):
         self.stop_audio()
         role = (self.role_edit.text() or "目标角色").strip()
         total = round(sum(s["dur"] for s in segs), 2)
+        track = manifest.run_audio_track(self.sid, self.run_id)
         payload = {
+            "schema": manifest.SELECTION_SCHEMA,
             "version": manifest.VERSION,
             "source_id": self.sid,
             "run_id": self.run_id,
@@ -1081,7 +1454,7 @@ class MainWindow(QMainWindow):
             "created": datetime.now().isoformat(timespec="seconds"),
             "threshold": self.thr_spin.value(),
             "model": self.model_combo.currentText(),
-            "audio_track": self.audio_track(),
+            "audio_track": track,
             "seed_ids": sorted(self.seed_ids),
             "merge_gap": self.gap_spin.value(),
             "pad_head": self.pad_h.value(),
@@ -1103,7 +1476,7 @@ class MainWindow(QMainWindow):
             Step("cut.py", ["--video", self.video,
                             "--scale", SCALES[self.scale_combo.currentText()],
                             "--crf", str(self.crf_spin.value()),
-                            "--audio-track", str(self.audio_track()),
+                            "--audio-track", str(track),
                             "--vfr", frame_mode,
                             "--output", out_path], 88, "切割拼接"),
             Step("gen_report.py", ["--video", self.video,
@@ -1112,6 +1485,9 @@ class MainWindow(QMainWindow):
         self.runner.start(steps, 100.0)
 
     def on_finished(self, ok, msg):
+        if self.mode == "queue":
+            self._finish_queue_item(ok, msg)
+            return
         self._busy(False)
         if not ok:
             self.set_stage(msg)

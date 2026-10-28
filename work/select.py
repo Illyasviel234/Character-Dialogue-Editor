@@ -107,6 +107,7 @@ def main():
     run_rec = ((manifest.load_manifest(sid) or {}).get("runs") or {}).get(rid) or {}
     track = int(run_rec.get("audio_track", manifest.audio_track(sid)))
     payload = {
+        "schema": manifest.SELECTION_SCHEMA,
         "version": manifest.VERSION,
         "source_id": sid,
         "run_id": tr.get("run_id"),

@@ -29,7 +29,7 @@ def main():
     args = p.parse_args()
 
     video = cli.resolve_video(args.video)
-    sid, jdir = cli.job_of(video)
+    sid, source, jdir, info = cli.prepare(video)
 
     sel_path = os.path.join(jdir, manifest.SELECTED)
     if not os.path.exists(sel_path):
@@ -37,7 +37,7 @@ def main():
     with open(sel_path, encoding="utf-8") as f:
         sel = json.load(f)
 
-    ok, why = manifest.validate_selection(sid, sel)
+    ok, why = manifest.validate_selection(sid, sel, source)
     if not ok:
         sys.exit(f"切点方案不可用：{why}")
     segs = sel.get("segments") or []
