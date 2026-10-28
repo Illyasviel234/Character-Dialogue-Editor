@@ -322,6 +322,31 @@ class TestRunLifecycle(ManifestCase):
         self.assertFalse(ok)
         self.assertIn("音频", why)
 
+    def test_missing_audio_json_rejected(self):
+        """只有 WAV 没有 audio.json：无法证明音频来源，必须拒绝。"""
+        sid, rid = self._prepare([0, 1], [0, 1])
+        os.remove(manifest.run_artifact(sid, rid, manifest.AUDIO_INFO))
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("audio.json", why)
+
+    def test_corrupt_audio_json_rejected(self):
+        sid, rid = self._prepare([0, 1], [0, 1])
+        with open(manifest.run_artifact(sid, rid, manifest.AUDIO_INFO), "w",
+                  encoding="utf-8") as f:
+            f.write("{broken")
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("audio.json", why)
+
+    def test_audio_json_missing_fields_rejected(self):
+        sid, rid = self._prepare([0, 1], [0, 1])
+        manifest.atomic_write_json(manifest.run_artifact(sid, rid, manifest.AUDIO_INFO),
+                                   {"source_id": sid, "track": 0})
+        ok, why = manifest.finalize_run(sid, rid)
+        self.assertFalse(ok)
+        self.assertIn("缺少字段", why)
+
     def test_missing_audio_rejected(self):
         sid, rid = self._prepare([0, 1], [0, 1])
         os.remove(manifest.run_artifact(sid, rid, manifest.AUDIO_WAV))

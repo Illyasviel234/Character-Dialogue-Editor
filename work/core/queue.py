@@ -5,10 +5,14 @@
 
 每个条目自带全部参数（角色、特征词、阈值、留白、音轨、输出规格），
 不依赖界面上当前的值——否则改一次阈值会把队列里已排好的任务也改掉。
+
+条目带一个稳定的 id：运行中调整顺序时，完成回调按 id 回写，
+不会因为数组下标变化把结果记到别的任务上。
 """
 
 import json
 import os
+import uuid
 
 from . import manifest, naming, paths
 
@@ -41,10 +45,15 @@ def queue_path():
     return os.path.join(paths.WORK, QUEUE_FILE)
 
 
+def new_id():
+    return uuid.uuid4().hex[:8]
+
+
 def make_item(video, **kw):
     item = dict(FIELDS)
     item.update(kw)
     item["video"] = os.path.abspath(video) if video else ""
+    item["id"] = kw.get("id") or new_id()
     item["status"] = WAITING
     item["message"] = ""
     return item
@@ -66,7 +75,9 @@ def load(path=None):
         if not isinstance(raw, dict) or not raw.get("video"):
             continue
         item = make_item(raw["video"])
-        item.update({k: raw[k] for k in list(FIELDS) + ["video"] if k in raw})
+        item.update({k: raw[k] for k in list(FIELDS) + ["video", "id"] if k in raw})
+        if not item.get("id"):
+            item["id"] = new_id()
         item["status"] = WAITING if raw.get("status") in (RUNNING, CANCELLED) else raw.get("status", WAITING)
         item["message"] = raw.get("message", "")
         out.append(item)
@@ -83,12 +94,80 @@ def save(items, path=None):
     os.replace(tmp, path)
 
 
-def output_path(item):
-    """队列条目的成片路径：默认 output/，也可指定目录。"""
+_SUFFIX_CACHE = {}
+
+
+def source_suffix(video):
+    """源文件内容指纹的后 8 位，用来区分不同目录下的同名视频。
+
+    表格每刷新一次都会算一次文件名，所以这里按（路径, 大小, mtime）记一层，
+    避免反复读指纹缓存文件。
+    """
+    try:
+        st = os.stat(video)
+    except OSError:
+        return ""
+    key = (os.path.normcase(os.path.abspath(video)), st.st_size, st.st_mtime_ns)
+    if key in _SUFFIX_CACHE:
+        return _SUFFIX_CACHE[key]
+    try:
+        sid = manifest.source_id(video)
+        suffix = sid.rsplit("-", 1)[-1][:8] if "-" in sid else ""
+    except Exception:
+        suffix = ""
+    _SUFFIX_CACHE[key] = suffix
+    return suffix
+
+
+def base_name(item):
+    """成片与清单共用的文件名主干。
+
+    带上源指纹短摘要：`D:/s1/same.mp4` 和 `E:/s2/same.mp4` 角色相同时，
+    只靠 stem + 角色名会算出同一个输出路径，后跑的会静默覆盖前一个。
+    """
     stem = naming.safe_stem(item["video"])
     role = naming.safe_filename(item.get("role") or "目标角色", fallback="role")
+    suffix = source_suffix(item["video"])
+    return f"{stem}_{role}_{suffix}" if suffix else f"{stem}_{role}"
+
+
+def output_path(item):
+    """队列条目的成片路径：默认 output/，也可指定目录。"""
     out_dir = item.get("out_dir") or paths.OUTPUT
-    return os.path.abspath(os.path.join(out_dir, f"{stem}_{role}_clip.mp4"))
+    return os.path.abspath(os.path.join(out_dir, f"{base_name(item)}_clip.mp4"))
+
+
+def targets(item):
+    """这一条会写出的全部文件：成片 + CSV + HTML 清单。"""
+    clip = output_path(item)
+    folder = os.path.dirname(clip)
+    base = base_name(item)
+    return {
+        "video": clip,
+        "csv": os.path.join(folder, f"{base}_清单.csv"),
+        "html": os.path.join(folder, f"{base}_清单.html"),
+    }
+
+
+def conflicts(items):
+    """找出会写入同一文件的条目。返回 [(路径, [(id, 视频名), ...]), ...]。"""
+    seen = {}
+    for item in items:
+        for path in targets(item).values():
+            seen.setdefault(os.path.normcase(path), []).append(
+                (item.get("id") or "?", os.path.basename(item.get("video") or "")))
+    return [(path, owners) for path, owners in seen.items() if len(owners) > 1]
+
+
+def apply_out_dir(items, out_dir):
+    """把队列级输出目录应用到所有未完成的条目，返回改动的条数。"""
+    target = os.path.abspath(out_dir)
+    changed = 0
+    for item in items:
+        if item.get("status") != DONE and item.get("out_dir") != target:
+            item["out_dir"] = target
+            changed += 1
+    return changed
 
 
 def analysis_state(item):
@@ -139,7 +218,8 @@ def build_steps(item):
                         "--output", output_path(item)],
              22, "切割拼接"),
             ("gen_report.py", ["--video", video,
-                               "--out-dir", os.path.dirname(output_path(item))],
+                               "--out-dir", os.path.dirname(output_path(item)),
+                               "--base-name", base_name(item)],
              3, "生成清单"),
         ]
     else:
@@ -159,7 +239,8 @@ def build_steps(item):
                         "--output", output_path(item)],
              90, "切割拼接"),
             ("gen_report.py", ["--video", video,
-                               "--out-dir", os.path.dirname(output_path(item))],
+                               "--out-dir", os.path.dirname(output_path(item)),
+                               "--base-name", base_name(item)],
              7, "生成清单"),
         ]
     return steps

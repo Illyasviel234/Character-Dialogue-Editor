@@ -109,6 +109,7 @@ class MainWindow(QMainWindow):
         self.queue_items = queue.load()
         self.queue_running = False
         self.queue_i = 0
+        self.current_item_id = ""
 
         self.player = Player(self)
         self.player.failed.connect(self.append_log)
@@ -507,6 +508,7 @@ class MainWindow(QMainWindow):
         self.btn_add.setObjectName("primary")
         self.btn_add.clicked.connect(self.add_to_queue)
         bar.addWidget(self.btn_add)
+        self.queue_edit_buttons = []
         for text, slot in (("上移", lambda: self.move_queue(-1)),
                            ("下移", lambda: self.move_queue(1)),
                            ("移除", self.remove_queue),
@@ -515,11 +517,13 @@ class MainWindow(QMainWindow):
             b.setFixedWidth(58)
             b.clicked.connect(slot)
             bar.addWidget(b)
+            self.queue_edit_buttons.append(b)
         bar.addStretch(1)
         v.addLayout(bar)
 
-        self.queue_table = QTableWidget(0, 5)
-        self.queue_table.setHorizontalHeaderLabels(["视频", "角色", "音轨", "状态", "说明"])
+        self.queue_table = QTableWidget(0, 6)
+        self.queue_table.setHorizontalHeaderLabels(
+            ["视频", "角色", "音轨", "状态", "输出文件", "说明"])
         self.queue_table.verticalHeader().setVisible(False)
         self.queue_table.setShowGrid(False)
         self.queue_table.setAlternatingRowColors(True)
@@ -527,25 +531,27 @@ class MainWindow(QMainWindow):
         self.queue_table.setSelectionMode(QTableWidget.SingleSelection)
         self.queue_table.setEditTriggers(QTableWidget.NoEditTriggers)
         qh = self.queue_table.horizontalHeader()
-        qh.setSectionResizeMode(0, QHeaderView.Stretch)
-        qh.setSectionResizeMode(1, QHeaderView.Fixed)
-        qh.setSectionResizeMode(2, QHeaderView.Fixed)
-        qh.setSectionResizeMode(3, QHeaderView.Fixed)
-        qh.setSectionResizeMode(4, QHeaderView.Stretch)
-        self.queue_table.setColumnWidth(1, 110)
-        self.queue_table.setColumnWidth(2, 56)
-        self.queue_table.setColumnWidth(3, 72)
+        for col in range(5):
+            qh.setSectionResizeMode(col, QHeaderView.Fixed)
+        qh.setSectionResizeMode(5, QHeaderView.Stretch)
+        self.queue_table.setColumnWidth(0, 132)
+        self.queue_table.setColumnWidth(1, 84)
+        self.queue_table.setColumnWidth(2, 44)
+        self.queue_table.setColumnWidth(3, 68)
+        self.queue_table.setColumnWidth(4, 248)
         v.addWidget(self.queue_table, 1)
 
         v.addWidget(self._hint(
             "队列按顺序执行：没有分析结果的先分析，已有结果的直接切。"
-            "每条的参数取自加入队列时的界面设置，之后改界面不影响已排队的任务。"))
+            "每条的剪辑参数取自加入队列时的界面设置；输出目录是队列级的，"
+            "点「开始队列」时统一应用到所有未完成条目。"))
 
         row = QHBoxLayout()
         row.setSpacing(7)
-        row.addWidget(QLabel("输出目录"))
+        row.addWidget(QLabel("队列输出目录"))
         self.queue_out = QLineEdit(paths.OUTPUT)
-        self.queue_out.setToolTip("队列内所有成片的输出目录")
+        self.queue_out.setToolTip("开始队列时应用到所有未完成条目；已完成的不变")
+        self.queue_out.textChanged.connect(lambda _t: self._refresh_queue())
         row.addWidget(self.queue_out, 1)
         qbrowse = QPushButton("浏览")
         qbrowse.setFixedWidth(58)
@@ -602,10 +608,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "已在队列中",
                                         "同一个视频和角色已经排过队；要改参数可以先移除再加。")
                 return
-        self.queue_items.append(queue.make_item(self.video, **params))
+        item = queue.make_item(self.video, **params)
+        self.queue_items.append(item)
         self._persist_queue()
         self._refresh_queue()
-        self.append_log(f"[队列] 已加入 {os.path.basename(self.video)} · {params['role']}")
+        self.append_log(f"[队列] 已加入 {os.path.basename(self.video)} · {params['role']}"
+                        f" → {os.path.basename(queue.output_path(item))}")
+        if queue.conflicts(self.queue_items):
+            self.append_log("[队列] 注意：当前队列存在输出冲突，启动前需要处理")
 
     def pick_queue_dir(self):
         d = QFileDialog.getExistingDirectory(
@@ -616,7 +626,20 @@ class MainWindow(QMainWindow):
     def _queue_row(self):
         return self.queue_table.currentRow()
 
+    def _queue_locked(self):
+        """运行中禁止改动队列结构。
+
+        条目有稳定 id，完成回写本身不看下标；但运行中重排会让"下一个跑哪个"
+        变得难以解释，用户也容易误以为改动已生效，所以直接锁住。
+        """
+        if self.queue_running:
+            QMessageBox.information(self, "提示", "队列正在运行，先点「停止」再调整顺序。")
+            return True
+        return False
+
     def move_queue(self, delta):
+        if self._queue_locked():
+            return
         r = self._queue_row()
         t = r + delta
         if r < 0 or not 0 <= t < len(self.queue_items):
@@ -627,18 +650,16 @@ class MainWindow(QMainWindow):
         self.queue_table.selectRow(t)
 
     def remove_queue(self):
+        if self._queue_locked():
+            return
         r = self._queue_row()
         if 0 <= r < len(self.queue_items):
-            if self.queue_items[r]["status"] == queue.RUNNING:
-                QMessageBox.information(self, "提示", "正在跑的任务不能移除，先点停止。")
-                return
             self.queue_items.pop(r)
             self._persist_queue()
             self._refresh_queue()
 
     def clear_queue(self):
-        if self.queue_running:
-            QMessageBox.information(self, "提示", "队列正在运行，先点停止。")
+        if self._queue_locked():
             return
         if not self.queue_items:
             return
@@ -663,19 +684,50 @@ class MainWindow(QMainWindow):
         t.setRowCount(len(self.queue_items))
         colors = {queue.DONE: "#5dcaa5", queue.FAILED: "#e0736a",
                   queue.RUNNING: "#c9a227", queue.CANCELLED: "#8a8880"}
+        out_dir = self.queue_out.text().strip()
         for r, item in enumerate(self.queue_items):
             t.setItem(r, 0, QTableWidgetItem(os.path.basename(item["video"])))
             t.setItem(r, 1, QTableWidgetItem(item.get("role") or ""))
-            t.setItem(r, 2, QTableWidgetItem(f"第 {int(item.get('audio_track', 0)) + 1} 条"))
+            track = int(item.get("audio_track", 0)) + 1
+            cell = QTableWidgetItem(str(track))
+            cell.setTextAlignment(Qt.AlignCenter)
+            cell.setToolTip(f"第 {track} 条音轨")
+            t.setItem(r, 2, cell)
             st = QTableWidgetItem(item.get("status") or queue.WAITING)
             st.setForeground(QColor(colors.get(item.get("status"), "#c9c7c0")))
             t.setItem(r, 3, st)
-            t.setItem(r, 4, QTableWidgetItem(item.get("message") or ""))
+            name = QTableWidgetItem(os.path.basename(queue.output_path(item)))
+            name.setToolTip(queue.output_path(item))
+            t.setItem(r, 4, name)
+            t.setItem(r, 5, QTableWidgetItem(item.get("message") or ""))
         t.setUpdatesEnabled(True)
-        self.queue_label.setText(
-            f"共 {len(self.queue_items)} 条 · "
-            f"完成 {sum(1 for i in self.queue_items if i['status'] == queue.DONE)} · "
-            f"失败 {sum(1 for i in self.queue_items if i['status'] == queue.FAILED)}")
+
+        pending = [i for i in self.queue_items if i["status"] != queue.DONE]
+        stale = sum(1 for i in pending
+                    if out_dir and os.path.normcase(os.path.abspath(i.get("out_dir") or ""))
+                    != os.path.normcase(os.path.abspath(out_dir)))
+        bits = [f"共 {len(self.queue_items)} 条",
+                f"完成 {sum(1 for i in self.queue_items if i['status'] == queue.DONE)}",
+                f"失败 {sum(1 for i in self.queue_items if i['status'] == queue.FAILED)}"]
+        if stale:
+            bits.append(f"{stale} 条待运行时会改到当前目录")
+        self.queue_label.setText(" · ".join(bits))
+
+    def _queue_conflicts(self):
+        """启动前检查输出冲突：同名视频 + 同角色会算出同一个文件。"""
+        bad = queue.conflicts(self.queue_items)
+        if not bad:
+            return True
+        lines = []
+        for path, owners in bad[:8]:
+            who = "、".join(f"{name}（{oid}）" for oid, name in owners)
+            lines.append(f"{os.path.basename(path)} ← {who}")
+        self.append_log("[队列] 输出路径冲突，已阻止启动：" + "；".join(lines))
+        QMessageBox.warning(
+            self, "输出冲突",
+            "以下条目会写入同一个文件，请改角色名或队列输出目录后再启动：\n\n"
+            + "\n".join(lines))
+        return False
 
     def start_queue(self):
         if self.queue_running or self.runner.running():
@@ -683,20 +735,27 @@ class MainWindow(QMainWindow):
         if not self.queue_items:
             QMessageBox.warning(self, "提示", "队列为空，先把视频加入队列。")
             return
+
+        # 输出目录是队列级设置：启动时统一应用到所有未完成条目
+        changed = queue.apply_out_dir(self.queue_items, self.queue_out.text().strip()
+                                      or paths.OUTPUT)
         for item in self.queue_items:
             if item["status"] != queue.DONE:
                 item["status"] = queue.WAITING
                 item["message"] = ""
         self._persist_queue()
         self._refresh_queue()
+        if changed:
+            self.append_log(f"[队列] 输出目录已应用到 {changed} 条待运行任务")
+        if not self._queue_conflicts():
+            return
 
         self.queue_running = True
         self.queue_i = 0
+        self.current_item_id = ""
         self.mode = "queue"
         self.log_view.clear()
-        self.btn_queue_start.setEnabled(False)
-        self.btn_queue_stop.setEnabled(True)
-        self.btn_add.setEnabled(False)
+        self._set_queue_ui_running(True)
         self.progress.setValue(0)
         self._run_next_queue_item()
 
@@ -716,6 +775,7 @@ class MainWindow(QMainWindow):
             need, why = queue.analysis_state(item)
             item["status"] = queue.RUNNING
             item["message"] = why
+            self.current_item_id = item.get("id") or ""
             self._refresh_queue()
             self.append_log(f"[队列 {self.queue_i + 1}/{len(self.queue_items)}] "
                             f"{os.path.basename(item['video'])} · {item.get('role')} · {why}")
@@ -736,12 +796,18 @@ class MainWindow(QMainWindow):
                         + (f"，失败 {len(failed)} 条" if failed else ""))
         self._refresh_queue()
 
+    def _set_queue_ui_running(self, running):
+        self.btn_queue_start.setEnabled(not running)
+        self.btn_queue_stop.setEnabled(running)
+        self.btn_add.setEnabled(not running)
+        for b in self.queue_edit_buttons:
+            b.setEnabled(not running)
+
     def _reset_queue_ui(self):
         self.queue_running = False
+        self.current_item_id = ""
         self.mode = None
-        self.btn_queue_start.setEnabled(True)
-        self.btn_queue_stop.setEnabled(False)
-        self.btn_add.setEnabled(True)
+        self._set_queue_ui_running(False)
 
     def _abort_queue(self):
         self._reset_queue_ui()
@@ -750,13 +816,19 @@ class MainWindow(QMainWindow):
         self.append_log("[队列] 已停止，未完成的任务保持原状")
         self._refresh_queue()
 
+    def _current_queue_item(self):
+        """按稳定 id 找当前任务，不依赖数组下标。"""
+        for item in self.queue_items:
+            if item.get("id") and item["id"] == self.current_item_id:
+                return item
+        return None
+
     def _finish_queue_item(self, ok, msg):
-        item = (self.queue_items[self.queue_i]
-                if self.queue_i < len(self.queue_items) else None)
+        item = self._current_queue_item()
         if item is not None:
             if ok:
+                # 说明列保留"复用了哪个运行"，文件名已经在输出文件列里
                 item["status"] = queue.DONE
-                item["message"] = os.path.basename(queue.output_path(item))
             elif "取消" in (msg or ""):
                 item["status"] = queue.CANCELLED
                 item["message"] = "已取消"
@@ -766,6 +838,7 @@ class MainWindow(QMainWindow):
         self._persist_queue()
         self._refresh_queue()
         self.queue_i += 1
+        self.current_item_id = ""
         if not self.queue_running:
             self._abort_queue()
             return

@@ -26,6 +26,8 @@ def main():
     cli.add_video(p)
     p.add_argument("--out-dir", default=None,
                    help="清单输出目录，默认 output/")
+    p.add_argument("--base-name", default=None,
+                   help="文件名主干，默认 <源名>_<角色>；队列用它区分同名视频")
     args = p.parse_args()
 
     video = cli.resolve_video(args.video)
@@ -46,7 +48,7 @@ def main():
     src = sel.get("source") or man.get("source") or {}
     role = naming.safe_filename(sel.get("role") or "目标角色", fallback="role")
     stem = naming.safe_stem(src.get("name") or os.path.basename(video))
-    base = f"{stem}_{role}"
+    base = naming.safe_filename(args.base_name) if args.base_name else f"{stem}_{role}"
     duration = float(src.get("duration") or 0)
     total = float(sel.get("total_sec") or sum(s["dur"] for s in segs))
     pct = (total / duration * 100) if duration else 0

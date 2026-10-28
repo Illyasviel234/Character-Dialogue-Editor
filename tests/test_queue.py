@@ -72,16 +72,61 @@ class TestItem(QueueCase):
         rel = os.path.relpath(make_video(self.tmp.name))
         self.assertTrue(os.path.isabs(queue.make_item(rel)["video"]))
 
-    def test_output_path_uses_role_and_dir(self):
+    def test_output_path_uses_role_dir_and_hash(self):
         item = queue.make_item(make_video(self.tmp.name, "re0_08.mp4"),
                                role="碧翠丝", out_dir=os.path.join(self.tmp.name, "x"))
         path = queue.output_path(item)
-        self.assertEqual(os.path.basename(path), "re0_08_碧翠丝_clip.mp4")
+        name = os.path.basename(path)
+        self.assertTrue(name.startswith("re0_08_碧翠丝_"), name)
+        self.assertTrue(name.endswith("_clip.mp4"), name)
+        self.assertEqual(len(name.split("_")[-2]), 8, "应有 8 位源指纹摘要")
         self.assertTrue(path.startswith(os.path.join(self.tmp.name, "x")))
 
     def test_output_path_sanitizes_role(self):
         item = queue.make_item(make_video(self.tmp.name), role='a:b/c')
-        self.assertEqual(os.path.basename(queue.output_path(item)), "v_a_b_c_clip.mp4")
+        self.assertTrue(os.path.basename(queue.output_path(item)).startswith("v_a_b_c_"))
+
+    def test_same_name_different_dirs_do_not_collide(self):
+        """两个不同目录下的 same.mp4，角色相同时不能算出同一个输出。"""
+        a = os.path.join(self.tmp.name, "s1", "same.mp4")
+        b = os.path.join(self.tmp.name, "s2", "same.mp4")
+        for path, data in ((a, b"aaa" * 100), (b, b"bbb" * 100)):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+        one = queue.make_item(a, role="R", out_dir=self.tmp.name)
+        two = queue.make_item(b, role="R", out_dir=self.tmp.name)
+        self.assertNotEqual(queue.output_path(one), queue.output_path(two))
+        self.assertEqual(queue.conflicts([one, two]), [])
+
+    def test_conflicts_detected(self):
+        video = make_video(self.tmp.name)
+        one = queue.make_item(video, role="R", out_dir=self.tmp.name)
+        two = queue.make_item(video, role="R", out_dir=self.tmp.name)
+        bad = queue.conflicts([one, two])
+        self.assertTrue(bad)
+        path, owners = bad[0]
+        self.assertTrue(path.endswith("_clip.mp4"))
+        self.assertEqual(len(owners), 2)
+
+    def test_conflicts_cover_reports(self):
+        """清单文件名也要参与冲突检测，否则 HTML/CSV 会互相覆盖。"""
+        video = make_video(self.tmp.name)
+        one = queue.make_item(video, role="R", out_dir=self.tmp.name)
+        paths = queue.targets(one)
+        self.assertTrue(paths["csv"].endswith("_清单.csv"))
+        self.assertTrue(paths["html"].endswith("_清单.html"))
+        self.assertEqual(len({os.path.normcase(p) for p in paths.values()}), 3)
+
+    def test_apply_out_dir_skips_done(self):
+        a = queue.make_item(make_video(self.tmp.name, "a.mp4"), role="甲")
+        b = queue.make_item(make_video(self.tmp.name, "b.mp4"), role="乙")
+        a["status"] = queue.DONE
+        new_dir = os.path.join(self.tmp.name, "new")
+        changed = queue.apply_out_dir([a, b], new_dir)
+        self.assertEqual(changed, 1)
+        self.assertEqual(b["out_dir"], os.path.abspath(new_dir))
+        self.assertNotEqual(a["out_dir"], os.path.abspath(new_dir))
 
     def test_output_path_defaults_to_output_dir(self):
         item = queue.make_item(make_video(self.tmp.name), role="R", out_dir="")
@@ -152,6 +197,21 @@ class TestPersistence(QueueCase):
         self.assertEqual(back[0]["status"], queue.DONE)
         self.assertAlmostEqual(back[1]["threshold"], 0.7)
         self.assertEqual(back[1]["audio_track"], 1)
+
+    def test_ids_are_stable(self):
+        items = [queue.make_item(make_video(self.tmp.name, "a.mp4")),
+                 queue.make_item(make_video(self.tmp.name, "b.mp4"))]
+        ids = [i["id"] for i in items]
+        self.assertEqual(len(set(ids)), 2, "id 必须唯一")
+        queue.save(items)
+        back = queue.load()
+        self.assertEqual([i["id"] for i in back], ids, "保存后 id 不能变")
+
+    def test_legacy_item_without_id_gets_one(self):
+        with open(queue.queue_path(), "w", encoding="utf-8") as f:
+            json.dump({"items": [{"video": "a.mp4", "role": "x"}]}, f)
+        back = queue.load()
+        self.assertTrue(back[0].get("id"))
 
     def test_running_becomes_waiting(self):
         """上次被强杀时留下的「进行中」不能一直卡着。"""

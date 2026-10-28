@@ -179,6 +179,14 @@ def save_manifest(sid, data):
 
 # ---------- 音频音轨 ----------
 
+def _read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def load_audio_info(sid, run_id=None):
     """这份 16k 音频来自第几条音轨。
 
@@ -351,17 +359,34 @@ def validate_run(sid, run_id):
         if tr.get("run_id") != run_id:
             return False, f"转写属于运行 {tr.get('run_id') or '未知'}，不是本次运行"
 
-        if not audio_path(sid, run_id):
+        # 音频必须能追溯到源文件与音轨。只有 WAV、没有 audio.json 时无法证明
+        # 它来自哪条音轨，宁可拒绝也不要放行。
+        run_wav = run_artifact(sid, run_id, AUDIO_WAV)
+        run_info = run_artifact(sid, run_id, AUDIO_INFO)
+        legacy_wav = artifact(sid, AUDIO_WAV)
+        legacy_info = artifact(sid, AUDIO_INFO)
+        if os.path.exists(run_wav):
+            layout, info_path = "本次运行", run_info
+        elif os.path.exists(legacy_wav):
+            layout, info_path = "旧布局", legacy_info
+        else:
             return False, "缺少 16k 音频，请重新抽取"
-        side = load_audio_info(sid, run_id)
-        if side:
-            if side.get("source_id") and side["source_id"] != sid:
-                return False, "音频属于其他源文件"
-            used = int(rec.get("audio_track", 0))
-            have = int(side.get("track", 0))
-            if used != have:
-                return False, (f"音频来自第 {have + 1} 条音轨，本次运行用的是第 {used + 1} 条，"
-                               f"请重新抽取音频后再分析")
+        if not os.path.exists(info_path):
+            return False, f"{layout}缺少 audio.json，无法确认音频来源，请重新抽取"
+        side = _read_json(info_path)
+        if not isinstance(side, dict) or not side:
+            return False, "audio.json 无法解析，请重新抽取音频"
+        missing = [k for k in ("source_id", "track", "duration", "audio_streams")
+                   if k not in side]
+        if missing:
+            return False, "audio.json 缺少字段：" + "、".join(missing)
+        if side["source_id"] != sid:
+            return False, "音频属于其他源文件"
+        used = int(rec.get("audio_track", 0))
+        have = int(side["track"])
+        if used != have:
+            return False, (f"音频来自第 {have + 1} 条音轨，本次运行用的是第 {used + 1} 条，"
+                           f"请重新抽取音频后再分析")
 
         import numpy as np
         with np.load(epath) as d:

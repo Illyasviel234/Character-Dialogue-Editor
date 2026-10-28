@@ -66,7 +66,8 @@ class TestAudioIsolation(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, "-u", "extract_audio.py", "--video", self.video,
              "--audio-track", str(track)],
-            cwd=paths.WORK, capture_output=True, text=True, env=self._env())
+            cwd=paths.WORK, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=self._env())
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r.stdout
 
@@ -101,7 +102,8 @@ class TestAudioIsolation(unittest.TestCase):
         r = subprocess.run(
             [sys.executable, "-u", "extract_audio.py", "--video", self.video,
              "--audio-track", "5"],
-            cwd=paths.WORK, capture_output=True, text=True, env=self._env())
+            cwd=paths.WORK, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", env=self._env())
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("音轨", r.stdout + r.stderr)
 
